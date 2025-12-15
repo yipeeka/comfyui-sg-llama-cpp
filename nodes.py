@@ -16,6 +16,7 @@ from llama_cpp.llama_chat_format import (
     Gemma3ChatHandler,
     Qwen25VLChatHandler,
     Qwen3VLChatHandler,
+    LlamaChatCompletionHandlerRegistry,
 )
 import folder_paths
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
@@ -146,12 +147,7 @@ class LlamaCPPModelLoader(ComfyNodeABC):
             mmproj_list = ["None"]
 
         # Available chat formats from llama-cpp-python
-        base_chat_formats = [
-            "llama-2", "llama-3", "llama-4", "alpaca", "qwen", "vicuna", "oasst_llama", "baichuan-2", "baichuan",
-            "openbuddy", "redpajama-incite", "snoozy", "phind", "intel", "open-orca", "mistrallite", "zephyr",
-            "pygmalion", "chatml", "mistral-instruct", "chatglm3", "openchat", "saiga", "gemma", "functionary",
-            "functionary-v2", "functionary-v1", "chatml-function-calling",
-        ]
+        base_chat_formats = sorted(list(LlamaChatCompletionHandlerRegistry()._chat_handlers.keys()))
         vision_formats = list(VISION_HANDLERS.keys())
         chat_formats = sorted(base_chat_formats + vision_formats)
 
