@@ -4,6 +4,7 @@ import inspect
 import torch
 import base64
 import io
+import json
 from PIL import Image
 from llama_cpp import Llama, llama_backend_free
 from llama_cpp.llama_chat_format import (
@@ -13,6 +14,54 @@ from llama_cpp.llama_chat_format import (
 import folder_paths
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 from typing import Dict, Any, List, Type
+
+# Config file path
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
+
+def load_config() -> Dict[str, Any]:
+    """Load config from config.json, return empty dict if not found or invalid."""
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def get_user_model_folders() -> List[str]:
+    """Get user-specified model folders from config."""
+    config = load_config()
+    return config.get('model_folders', [])
+
+def get_merged_model_folders() -> List[str]:
+    """Merge ComfyUI text_encoders folders with user folders."""
+    try:
+        comfy_folders = folder_paths.get_folder_paths("text_encoders")
+    except:
+        comfy_folders = []
+    user_folders = get_user_model_folders()
+    all_folders = comfy_folders + user_folders
+    # Filter out non-existent paths
+    return [f for f in all_folders if os.path.exists(f)]
+
+def scan_gguf_models_in_folders() -> List[str]:
+    """Scan merged folders for GGUF model files."""
+    folders = get_merged_model_folders()
+    model_list = []
+    for folder in folders:
+        try:
+            files = os.listdir(folder)
+            model_list.extend([f for f in files if f.lower().endswith('.gguf')])
+        except:
+            pass  # Skip inaccessible folders
+    return model_list
+
+def find_model_path(model_name: str) -> str:
+    """Find full path to model in merged folders."""
+    folders = get_merged_model_folders()
+    for folder in folders:
+        path = os.path.join(folder, model_name)
+        if os.path.exists(path):
+            return path
+    return None
 
 # Global LLM instance for persistence
 _global_llm = None
@@ -112,16 +161,7 @@ for name, obj in inspect.getmembers(lcf):
 class LlamaCPPModelLoader(ComfyNodeABC):
     @classmethod
     def INPUT_TYPES(cls) -> InputTypeDict:
-        # Manually scan text_encoders folders for GGUF files since folder_paths filters by extensions
-        try:
-            folders = folder_paths.get_folder_paths("text_encoders")
-            model_list = []
-            for folder in folders:
-                if os.path.exists(folder):
-                    files = os.listdir(folder)
-                    model_list.extend([f for f in files if f.lower().endswith('.gguf')])
-        except:
-            model_list = []  # Fallback if folder doesn't exist
+        model_list = scan_gguf_models_in_folders()
 
         # Filter models based on criteria (case-insensitive)
         model_name_list = [f for f in model_list if 'mmproj' not in f.lower() and 'draft' not in f.lower()]
@@ -155,11 +195,10 @@ class LlamaCPPModelLoader(ComfyNodeABC):
 
     def load_model(self, model_name: str, chat_format: str = "llama-2", mmproj_model_name: str = "None") -> tuple:
         try:
-            # Get full path to model
-            model_path = folder_paths.get_full_path("text_encoders", model_name)
+            model_path = find_model_path(model_name)
 
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(f"Model file not found: {model_path}")
+            if model_path is None:
+                raise FileNotFoundError(f"Model file not found: {model_name}")
 
             if not model_name.lower().endswith('.gguf'):
                 raise ValueError(f"Selected file is not a GGUF model: {model_name}")
@@ -171,9 +210,9 @@ class LlamaCPPModelLoader(ComfyNodeABC):
 
             # Handle mmproj if provided and not "None"
             if mmproj_model_name and mmproj_model_name != "None":
-                mmproj_model_path = folder_paths.get_full_path("text_encoders", mmproj_model_name)
-                if not os.path.exists(mmproj_model_path):
-                    raise FileNotFoundError(f"Multi-modal projector model not found: {mmproj_model_path}")
+                mmproj_model_path = find_model_path(mmproj_model_name)
+                if mmproj_model_path is None:
+                    raise FileNotFoundError(f"Multi-modal projector model not found: {mmproj_model_name}")
                 model_info["mmproj_model_path"] = mmproj_model_path
 
             # Return model info dict
