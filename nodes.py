@@ -6,6 +6,7 @@ import base64
 import io
 import json
 from PIL import Image
+from torchvision.transforms import ToPILImage
 from llama_cpp import Llama, llama_backend_free
 from llama_cpp.llama_chat_format import (
     Llava15ChatHandler,
@@ -69,39 +70,17 @@ _global_llm = None
 def _convert_image_to_data_uri(image_tensor: torch.Tensor) -> str:
     """Convert a ComfyUI image tensor to a base64 data URI for vision models."""
     try:
-        # ComfyUI images are typically [B, H, W, C] with values in [0, 1] range
-        # Take the first image if batched
-        if image_tensor.dim() == 4:
-            image_tensor = image_tensor[0]  # Remove batch dimension
-
-        # Ensure tensor is in CPU and convert to PIL
-        image_tensor = image_tensor.cpu()
-
-        # Convert from [0, 1] to [0, 255] and to uint8
-        if image_tensor.dtype != torch.uint8:
-            image_tensor = (image_tensor * 255).clamp(0, 255).to(torch.uint8)
-
-        # Convert to PIL Image (assuming RGB)
-        if image_tensor.shape[2] == 3:  # RGB
-            pil_image = Image.fromarray(image_tensor.numpy(), mode='RGB')
-        elif image_tensor.shape[2] == 4:  # RGBA
-            pil_image = Image.fromarray(image_tensor.numpy(), mode='RGBA')
-        else:
-            raise ValueError(f"Unsupported image channels: {image_tensor.shape[2]}")
-
-        # Convert to JPEG bytes
-        buffer = io.BytesIO()
-        pil_image.save(buffer, format='JPEG', quality=95)
-        image_bytes = buffer.getvalue()
-
-        # Encode to base64 and create data URI
-        base64_string = base64.b64encode(image_bytes).decode('utf-8')
-        data_uri = f"data:image/jpeg;base64,{base64_string}"
-
-        # Clean up PIL Image and BytesIO buffer to prevent memory leaks
-        pil_image.close()
-        buffer.close()
-
+        to_pil = ToPILImage()
+        # ComfyUI images are (B, H, W, C), select first batch and permute to (C, H, W)
+        pil_img = to_pil(image_tensor[0].permute(2, 0, 1))
+        # Convert to base64
+        buffered = io.BytesIO()
+        pil_img.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+        data_uri = f"data:image/png;base64,{img_base64}"
+        # Clean up memory
+        buffered.close()
+        del pil_img
         return data_uri
 
     except Exception as e:
@@ -385,11 +364,11 @@ class LlamaCPPMemoryCleanup(ComfyNodeABC):
                 "memory_cleanup": (["close", "backend_free", "full_cleanup", "persistent"], {"default": "close", "tooltip": "Memory cleanup method"}),
             },
             "optional": {
-                "passthrough": ("*", {"tooltip": "Any input to pass through"}),
+                "passthrough": (IO.ANY, {"tooltip": "Any input to pass through"}),
             }
         }
 
-    RETURN_TYPES = ("*",)
+    RETURN_TYPES = (IO.ANY,)
     RETURN_NAMES = ("passthrough",)
     FUNCTION = "cleanup"
     CATEGORY = "LlamaCPP"
