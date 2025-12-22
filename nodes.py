@@ -245,7 +245,7 @@ class LlamaCPPOptions(ComfyNodeABC):
     def INPUT_TYPES(cls) -> InputTypeDict:
         return {
             "optional": {
-                "n_gpu_layers": ("INT", {"default": 0, "min": -1, "max": 100, "tooltip": "Number of GPU layers to use"}),
+                "n_gpu_layers": ("INT", {"default": -1, "min": -1, "max": 100, "tooltip": "Number of GPU layers to use"}),
                 "n_ctx": ("INT", {"default": 2048, "min": 0, "max": 262144, "tooltip": "Context window size (0 for max)"}),
                 "n_threads": ("INT", {"default": -1, "min": -1, "max": 256, "tooltip": "Number of threads (-1 for auto)"}),
                 "n_threads_batch": ("INT", {"default": -1, "min": -1, "max": 256, "tooltip": "Number of threads per batch (-1 for auto)"}),
@@ -267,7 +267,7 @@ class LlamaCPPOptions(ComfyNodeABC):
 
     def get_options(self, **kwargs) -> tuple:
         try:
-            # Filter out None/empty values (FIXED: removed v != -1 check)
+            # Filter out None/empty values
             options = {k: v for k, v in kwargs.items() if v is not None and v != ""}
 
             return (options,)
@@ -370,7 +370,7 @@ class LlamaCPPEngine(ComfyNodeABC):
                 _global_llm = Llama(**llama_kwargs)
 
             # Prepare response_format parameter
-            response_format_param = {"type": response_format} if response_format == "json_object" else None
+            response_format_param = {"type": response_format} if response_format is not None else None
 
             # Generate response using global LLM
             response = _global_llm.create_chat_completion(
