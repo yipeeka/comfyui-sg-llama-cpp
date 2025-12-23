@@ -60,6 +60,12 @@ Configures advanced parameters for the model.
   - `use_mmap`: Memory mapping (default: `Enabled`).
   - `use_mlock`: Memory locking (default: `Disabled`).
   - `verbose`: Verbose logging (default: `Disabled`).
+  - `vision_use_gpu`: Enable GPU for vision handler (default: `Enabled`).
+  - `vision_image_min_tokens`: Minimum image tokens (default: `-1`).
+  - `vision_image_max_tokens`: Maximum image tokens (default: `-1`).
+  - `vision_enable_thinking`: Enable thinking mode for GLMV models (default: `Disabled`).
+  - `vision_force_reasoning`: Force reasoning for QwenVL models (default: `Disabled`).
+  - `vision_add_vision_id`: Add vision ID for QwenVL models (default: `Enabled`).
 
 **Outputs**
 - `options`: A configuration dictionary.

@@ -257,6 +257,12 @@ class LlamaCPPOptions(ComfyNodeABC):
                 "use_mmap": (IO.BOOLEAN, {"default": True, "tooltip": "Enable memory-mapped files", "label_on": "Enabled", "label_off": "Disabled"}),
                 "use_mlock": (IO.BOOLEAN, {"default": False, "tooltip": "Enable lock for memory-mapped files", "label_on": "Enabled", "label_off": "Disabled"}),
                 "verbose": (IO.BOOLEAN, {"default": False, "tooltip": "Enable verbose logging", "label_on": "Enabled", "label_off": "Disabled"}),
+                "vision_use_gpu": (IO.BOOLEAN, {"default": True, "tooltip": "Vision: Enable GPU for vision handler", "label_on": "Enabled", "label_off": "Disabled"}),
+                "vision_image_min_tokens": ("INT", {"default": -1, "min": -1, "max": 16384, "tooltip": "Vision: Minimum image tokens (-1 for default)"}),
+                "vision_image_max_tokens": ("INT", {"default": -1, "min": -1, "max": 16384, "tooltip": "Vision: Maximum image tokens (-1 for default)"}),
+                "vision_enable_thinking": (IO.BOOLEAN, {"default": False, "tooltip": "Vision: Enable thinking (GLMV)", "label_on": "Enabled", "label_off": "Disabled"}),
+                "vision_force_reasoning": (IO.BOOLEAN, {"default": False, "tooltip": "Vision: Force reasoning (QwenVL)", "label_on": "Enabled", "label_off": "Disabled"}),
+                "vision_add_vision_id": (IO.BOOLEAN, {"default": True, "tooltip": "Vision: Add vision ID (QwenVL)", "label_on": "Enabled", "label_off": "Disabled"}),
             }
         }
 
@@ -351,12 +357,32 @@ class LlamaCPPEngine(ComfyNodeABC):
 
             # Add options
             for k, v in options.items():
-                llama_kwargs[k] = v
+                if not k.startswith("vision_"):
+                    llama_kwargs[k] = v
 
             # Handle vision models: use chat_handler based on chat_format
             if vision_enabled:
                 handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
-                chat_handler = handler_class(clip_model_path=model["mmproj_model_path"])
+                
+                # Dynamically get parameters from the base class and actual class (Llava15ChatHandler)
+                base_sig = inspect.signature(Llava15ChatHandler)
+                handler_params = set(base_sig.parameters.keys())
+                handler_sig = inspect.signature(handler_class)
+                handler_params.update(handler_sig.parameters.keys())
+                
+                handler_kwargs = {
+                    "clip_model_path": model["mmproj_model_path"],
+                    "verbose": options.get("verbose", False),
+                }
+
+                # Process vision_ prefixed options
+                for k, v in options.items():
+                    if k.startswith("vision_"):
+                        param_name = k.replace("vision_", "")
+                        if param_name in handler_params:
+                            handler_kwargs[param_name] = v
+
+                chat_handler = handler_class(**handler_kwargs)
                 llama_kwargs["chat_handler"] = chat_handler
                 # Remove chat_format when using vision handler
                 llama_kwargs.pop("chat_format", None)
