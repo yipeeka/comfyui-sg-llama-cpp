@@ -484,3 +484,189 @@ class LlamaCPPMemoryCleanup(ComfyNodeABC):
             print(f"LlamaCPP Memory Cleanup Error: {str(e)}")
 
         return (passthrough,)
+
+
+# ---------------------------------------------------------------------------
+# FireRed-OCR prompt (from conv_for_infer.py — FireRedTeam/FireRed-OCR)
+# ---------------------------------------------------------------------------
+_FIRERED_OCR_PROMPT = """You are an AI assistant specialized in converting PDF images to Markdown format. Please follow these instructions for the conversion:
+
+        1. Text Processing:
+        - Accurately recognize all text content in the PDF image without guessing or inferring.
+        - Convert the recognized text into Markdown format.
+        - Maintain the original document structure, including headings, paragraphs, lists, etc.
+
+        2. Mathematical Formula Processing:
+        - Convert all mathematical formulas to LaTeX format.
+        - Enclose inline formulas with \\( \\). For example: This is an inline formula \\( E = mc^2 \\)
+        - Enclose block formulas with \\[ \\]. For example: \\[ \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a} \\]
+
+        3. Table Processing:
+        - Convert tables to HTML format.
+        - Wrap the entire table with <table> and </table>.
+
+        4. Figure Handling:
+        - Ignore figures content in the PDF image. Do not attempt to describe or convert images.
+
+        5. Output Format:
+        - Ensure the output Markdown document has a clear structure with appropriate line breaks between elements.
+        - For complex layouts, try to maintain the original document's structure and format as closely as possible.
+
+        Please strictly follow these guidelines to ensure accuracy and consistency in the conversion. Your task is to accurately convert the content of the PDF image into Markdown format without adding any extra explanations or comments."""
+
+
+class FireRedOCREngine(ComfyNodeABC):
+    """Dedicated OCR node for FireRed-OCR GGUF models (Qwen3-VL-based).
+
+    Download the model + mmproj from:
+      https://huggingface.co/mradermacher/FireRed-OCR-GGUF
+        - FireRed-OCR.Q4_K_M.gguf  (or any quant)
+        - FireRed-OCR.mmproj-Q8_0.gguf
+
+    In the Model Loader, set chat_format to the Qwen2.5-VL vision handler
+    (e.g. 'vision-qwen25vl' or 'vision-qwen25vlchathandler' depending on
+    your llama-cpp-python version — check the loader dropdown).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        return {
+            "required": {
+                "model": ("LLAMA_MODEL", {"tooltip": "FireRed-OCR model loaded via Llama CPP Model Loader (must include mmproj)"}),
+                "image": ("IMAGE", {"tooltip": "Document/page image to OCR"}),
+            },
+            "optional": {
+                "options": ("LLAMA_OPTIONS", {"tooltip": "Model options from Llama CPP Options node"}),
+                "custom_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "tooltip": "Override the built-in OCR prompt. Leave empty to use the FireRed-OCR default prompt.",
+                }),
+                "n_ctx": ("INT", {"default": 32768, "min": 4096, "max": 131072, "tooltip": "Context window — must fit image tokens + prompt + output. VL images alone can eat 4k+ tokens."}),
+                "max_tokens": ("INT", {"default": 8192, "min": 128, "max": 65536, "tooltip": "Maximum tokens (documents need long output)"}),
+                "temperature": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "Lower = more deterministic OCR"}),
+                "memory_cleanup": (["close", "backend_free", "full_cleanup", "persistent"], {"default": "close", "tooltip": "Memory cleanup after generation"}),
+                "seed": ("INT", {"default": -1, "min": -1, "tooltip": "Random seed (-1 for random)"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("markdown",)
+    FUNCTION = "ocr"
+    CATEGORY = "LlamaCPP"
+
+    def ocr(
+        self,
+        model: Dict[str, Any],
+        image: torch.Tensor,
+        options: Dict[str, Any] = None,
+        custom_prompt: str = "",
+        n_ctx: int = 32768,
+        max_tokens: int = 8192,
+        temperature: float = 0.1,
+        memory_cleanup: str = "close",
+        seed: int = -1,
+    ) -> tuple:
+        global _global_llm
+        try:
+            if not isinstance(model, dict) or "model_path" not in model:
+                raise ValueError("Invalid model data — connect a Llama CPP Model Loader")
+
+            if "mmproj_model_path" not in model:
+                raise ValueError("FireRed-OCR requires a mmproj model. Set mmproj_model_name in the Model Loader.")
+
+            chat_format = model.get("chat_format", "")
+            if not chat_format.startswith("vision-"):
+                raise ValueError(
+                    f"chat_format '{chat_format}' does not look like a vision handler. "
+                    "Select a 'vision-*' format in the Model Loader (e.g. vision-qwen25vl)."
+                )
+
+            options = options or {}
+            model_path = model["model_path"]
+
+            # Build message with image + OCR prompt
+            prompt_text = custom_prompt.strip() if custom_prompt.strip() else _FIRERED_OCR_PROMPT
+            image_data_uri = _convert_image_to_data_uri(image)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": image_data_uri},
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }
+            ]
+
+            # Llama init kwargs
+            llama_kwargs = {
+                "model_path": model_path,
+            }
+            for k, v in options.items():
+                if not k.startswith("vision_"):
+                    llama_kwargs[k] = v
+
+            # Vision handler — same logic as LlamaCPPEngine
+            if llama_kwargs.get("n_threads", -1) <= 0:
+                llama_kwargs["n_threads"] = max(1, os.cpu_count() or 4)
+
+            handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
+
+            handler_params = set()
+            for klass in type.mro(handler_class):
+                if klass is object:
+                    continue
+                init = klass.__dict__.get('__init__')
+                if init is None:
+                    continue
+                try:
+                    sig = inspect.signature(init)
+                    for name, p in sig.parameters.items():
+                        if name == 'self':
+                            continue
+                        if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                            continue
+                        handler_params.add(name)
+                except (ValueError, TypeError):
+                    continue
+
+            handler_kwargs = {
+                "clip_model_path": model["mmproj_model_path"],
+                "verbose": options.get("verbose", False),
+            }
+            for k, v in options.items():
+                if k.startswith("vision_"):
+                    param_name = k.replace("vision_", "")
+                    if param_name in handler_params:
+                        handler_kwargs[param_name] = v
+
+            chat_handler = handler_class(**handler_kwargs)
+            llama_kwargs["chat_handler"] = chat_handler
+
+            # LLM lifecycle
+            if memory_cleanup == "persistent":
+                if _global_llm is None:
+                    _global_llm = Llama(**llama_kwargs)
+            else:
+                _cleanup_global_llm(memory_cleanup)
+                _global_llm = Llama(**llama_kwargs)
+
+            response = _global_llm.create_chat_completion(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=seed,
+            )
+
+            if not response or "choices" not in response or not response["choices"]:
+                raise RuntimeError("No response generated")
+
+            markdown_text = response["choices"][0]["message"]["content"] or ""
+
+            _cleanup_global_llm(memory_cleanup)
+
+        except Exception as e:
+            markdown_text = f"FireRed-OCR Error: {str(e)}"
+            print(f"[FireRedOCR] Error: {str(e)}")
+
+        return (markdown_text,)

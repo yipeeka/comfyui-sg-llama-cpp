@@ -13,6 +13,7 @@ ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vi
 - Thinking/reasoning model support with `enable_thinking` toggle and `strip_thinking` output
 - Concurrent multimodal image decoding (ThreadPoolExecutor)
 - Memory management options
+- **FireRed-OCR**: Dedicated document OCR node (PDF/image → Markdown, with LaTeX & HTML table support)
 
 ## Installation
 
@@ -127,6 +128,33 @@ Utility to manually free resources at a specific point in the workflow.
 
 ---
 
+### FireRedOCREngine
+Dedicated OCR node for **FireRed-OCR GGUF** models. Converts document/PDF images to structured Markdown using a built-in expert OCR prompt.
+
+**Inputs**
+- **Required**:
+  - `model`: Model from `LlamaCPPModelLoader` (must have `mmproj` selected and a `vision-*` chat format).
+  - `image`: Document or page image to OCR.
+- **Optional**:
+  - `options`: Options from `LlamaCPPOptions`.
+  - `custom_prompt`: Override the built-in OCR prompt. Leave empty to use the official FireRed-OCR prompt.
+  - `max_tokens`: Maximum tokens to generate (default: `8192` — documents need long output).
+  - `temperature`: Sampling temperature (default: `0.1` — lower = more deterministic).
+  - `memory_cleanup`: Memory strategy after generation (default: `close`).
+  - `seed`: Random seed, `-1` for random (default: `-1`).
+
+**Outputs**
+- `markdown`: The recognized document in Markdown format (tables as HTML, formulas as LaTeX).
+
+**Quick setup**
+1. Download from [mradermacher/FireRed-OCR-GGUF](https://huggingface.co/mradermacher/FireRed-OCR-GGUF):
+   - `FireRed-OCR.Q4_K_M.gguf` (or any quant)
+   - `FireRed-OCR.mmproj-Q8_0.gguf`
+2. In `LlamaCPPModelLoader`: set `mmproj_model_name` and pick the `vision-qwen25vl` (or similar) chat format.
+3. Connect: `Load Image → LlamaCPPModelLoader → FireRed OCR Engine → Show Text`
+
+---
+
 ## Custom Model Folders
 
 By default, the node loads GGUF models from ComfyUI's `text_encoders` folder. You can optionally specify additional folders with a `config.json` file.
@@ -162,6 +190,17 @@ Vision inference requires:
 Supported handlers are auto-detected at startup from the installed llama-cpp-python version. Supported models include: LLaVA 1.5/1.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5, MiniCPM-V 2.6/4.5, Gemma3, GLM-4V, Moondream, LFM2-VL, and more.
 
 > **n_threads for vision**: The vision pipeline uses multi-threaded image decoding. If `n_threads` is set to `-1` (auto), the node automatically sets it to `os.cpu_count()` to avoid a crash in `ThreadPoolExecutor`.
+
+### FireRed-OCR
+
+[FireRed-OCR](https://github.com/FireRedTeam/FireRed-OCR) is a Qwen3-VL-2B-based SOTA document OCR model. Use the dedicated **FireRed OCR Engine** node for best results — it pre-bakes the expert OCR prompt automatically.
+
+| File | Description |
+|---|---|
+| `FireRed-OCR.Q4_K_M.gguf` | Main model (recommended quant) |
+| `FireRed-OCR.mmproj-Q8_0.gguf` | Visual projector |
+
+Download: [mradermacher/FireRed-OCR-GGUF](https://huggingface.co/mradermacher/FireRed-OCR-GGUF)
 
 ---
 
