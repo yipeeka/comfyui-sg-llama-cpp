@@ -1,6 +1,6 @@
 # comfyui-sg-llama-cpp
 
-ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vision models. It allows the user to generate text responses from prompts using llama.cpp.
+ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vision models and document OCR. Allows generating text responses from prompts using llama.cpp.
 
 ![Screenshot](assets/node_preview.png)
 
@@ -8,11 +8,12 @@ ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vi
 
 - Load and use GGUF models (including vision models)
 - Generate text prompts using llama.cpp
-- Support for multi-modal inputs (images)
+- Support for multi-modal inputs (multiple images per request)
 - Vision pipeline powered by `MTMDChatHandler` (llama-cpp-python ≥ v0.3.28)
 - Thinking/reasoning model support with `enable_thinking` toggle and `strip_thinking` output
 - Concurrent multimodal image decoding (ThreadPoolExecutor)
 - Memory management options
+- **PDF Loader**: Convert PDF pages to ComfyUI IMAGE batches (requires `pymupdf`)
 - **FireRed-OCR**: Dedicated document OCR node (PDF/image → Markdown, with LaTeX & HTML table support)
 
 ## Installation
@@ -28,7 +29,12 @@ ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vi
    git clone https://github.com/sebagallo/comfyui-sg-llama-cpp
    ```
 
-3. Restart ComfyUI.
+3. Install Python dependencies:
+   ```bash
+   pip install pymupdf
+   ```
+
+4. Restart ComfyUI.
 
 ## Node Reference
 
@@ -56,7 +62,7 @@ Configures advanced parameters for the model.
 **Inputs**
 - **Optional**:
   - `n_gpu_layers`: Layers to offload to GPU VRAM. `0` = CPU only, `-1` = all layers on GPU (default: `-1`).
-  - `n_ctx`: Context window size. Larger = more memory (default: `2048`).
+  - `n_ctx`: Context window size. Larger = more memory (default: `2048`). For OCR/vision, use `32768`+.
   - `n_threads`: CPU threads to use. `-1` = auto (default: `-1`).
   - `n_threads_batch`: Threads for batch processing. `-1` = auto (default: `-1`).
   - `n_batch`: Batch size (default: `512`).
@@ -85,14 +91,14 @@ The main generation node.
   - `model`: The model from `LlamaCPPModelLoader`.
   - `prompt`: The text prompt.
 - **Optional**:
-  - `image`: Input image for vision models (requires `vision-*` chat format + mmproj).
+  - `image`: Input image(s) for vision models. Accepts a full IMAGE batch — all images are sent to the model in a single request (requires `vision-*` chat format + mmproj).
   - `options`: Options from `LlamaCPPOptions`.
   - `system_prompt`: System instruction (default: empty).
   - `memory_cleanup`: Memory strategy after generation (default: `close`).
     - `close`: Free the model after each run.
     - `backend_free`: Free model + llama backend.
     - `full_cleanup`: Free model + backend + CUDA cache.
-    - `persistent`: Keep model loaded between runs (fastest for repeated use).
+    - `persistent`: Keep model loaded between runs (fastest for repeated use). Automatically reloads if the model changes.
   - `response_format`: `text` or `json_object` (default: `text`).
   - `enable_thinking`: Enable thinking/reasoning output for thinking models (Qwen3, Qwen3.5, QwQ, etc.). When disabled, injects an empty `<think></think>` prefix to force the model to skip reasoning (default: `Enabled`).
   - `max_tokens`: Maximum tokens to generate (default: `512`).
@@ -128,15 +134,41 @@ Utility to manually free resources at a specific point in the workflow.
 
 ---
 
+### PDFLoader
+Renders PDF pages as a ComfyUI `IMAGE` batch. Use this to feed PDFs into any vision node.
+
+Requires `pymupdf` (`pip install pymupdf`).
+
+**Inputs**
+- **Required**:
+  - `pdf_path`: Absolute path to the PDF file. Both forward (`/`) and back (`\`) slashes work on Windows.
+- **Optional**:
+  - `dpi`: Render resolution (default: `150`, range: 72–600). Higher = sharper but more memory.
+  - `page_start`: First page to load, 1-indexed (default: `1`).
+  - `page_end`: Last page to load, 0 = all pages (default: `0`).
+
+**Outputs**
+- `images`: All rendered pages as a single `IMAGE` batch `(B, H, W, C)`. Pages of different sizes are zero-padded to the largest dimensions.
+- `page_count`: Number of pages loaded.
+
+**Example workflows**
+```
+PDF Loader → FireRed OCR Engine → Show Text
+PDF Loader → Llama CPP Engine   → Show Text
+PDF Loader → Preview Image
+```
+
+---
+
 ### FireRedOCREngine
-Dedicated OCR node for **FireRed-OCR GGUF** models. Converts document/PDF images to structured Markdown using a built-in expert OCR prompt.
+Dedicated OCR node for **FireRed-OCR GGUF** models. Converts document/page images to structured Markdown using a built-in expert OCR prompt. Each image in the batch is processed individually to avoid context overflow.
 
 **Inputs**
 - **Required**:
   - `model`: Model from `LlamaCPPModelLoader` (must have `mmproj` selected and a `vision-*` chat format).
-  - `image`: Document or page image to OCR.
+  - `image`: Document or page image batch to OCR. Use `PDFLoader` to load PDF files.
 - **Optional**:
-  - `options`: Options from `LlamaCPPOptions`.
+  - `options`: Options from `LlamaCPPOptions`. Set `n_ctx` to at least `32768` for documents.
   - `custom_prompt`: Override the built-in OCR prompt. Leave empty to use the official FireRed-OCR prompt.
   - `max_tokens`: Maximum tokens to generate (default: `8192` — documents need long output).
   - `temperature`: Sampling temperature (default: `0.1` — lower = more deterministic).
@@ -144,14 +176,15 @@ Dedicated OCR node for **FireRed-OCR GGUF** models. Converts document/PDF images
   - `seed`: Random seed, `-1` for random (default: `-1`).
 
 **Outputs**
-- `markdown`: The recognized document in Markdown format (tables as HTML, formulas as LaTeX).
+- `markdown`: The recognized document in Markdown format (tables as HTML, formulas as LaTeX). Multiple pages are separated by `<!-- Page N -->` comments.
 
 **Quick setup**
 1. Download from [mradermacher/FireRed-OCR-GGUF](https://huggingface.co/mradermacher/FireRed-OCR-GGUF):
    - `FireRed-OCR.Q4_K_M.gguf` (or any quant)
    - `FireRed-OCR.mmproj-Q8_0.gguf`
 2. In `LlamaCPPModelLoader`: set `mmproj_model_name` and pick the `vision-qwen25vl` (or similar) chat format.
-3. Connect: `Load Image → LlamaCPPModelLoader → FireRed OCR Engine → Show Text`
+3. Set `n_ctx` to `32768`+ in `LlamaCPPOptions`.
+4. Connect: `PDF Loader → LlamaCPPModelLoader → FireRed OCR Engine → Show Text`
 
 ---
 
@@ -189,6 +222,8 @@ Vision inference requires:
 
 Supported handlers are auto-detected at startup from the installed llama-cpp-python version. Supported models include: LLaVA 1.5/1.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5, MiniCPM-V 2.6/4.5, Gemma3, GLM-4V, Moondream, LFM2-VL, and more.
 
+**Multiple images**: All images in a ComfyUI IMAGE batch are sent to the model in a single request. Use `PDF Loader` or the native `Load Images` node to build multi-image batches.
+
 > **n_threads for vision**: The vision pipeline uses multi-threaded image decoding. If `n_threads` is set to `-1` (auto), the node automatically sets it to `os.cpu_count()` to avoid a crash in `ThreadPoolExecutor`.
 
 ### FireRed-OCR
@@ -207,6 +242,7 @@ Download: [mradermacher/FireRed-OCR-GGUF](https://huggingface.co/mradermacher/Fi
 ## Requirements
 
 - llama-cpp-python ≥ v0.3.30 (from https://github.com/JamePeng/llama-cpp-python)
+- pymupdf (optional, for PDF support — `pip install pymupdf`)
 
 ## License
 

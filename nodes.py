@@ -72,12 +72,13 @@ def find_model_path(model_name: str) -> str:
 # Global LLM instance for persistence
 _global_llm = None
 
-def _convert_image_to_data_uri(image_tensor: torch.Tensor) -> str:
+def _convert_image_to_data_uri(image_tensor: torch.Tensor, batch_index: int = 0) -> str:
     """Convert a ComfyUI image tensor to a base64 data URI for vision models."""
     try:
         to_pil = ToPILImage()
-        # ComfyUI images are (B, H, W, C), select first batch and permute to (C, H, W)
-        pil_img = to_pil(image_tensor[0].permute(2, 0, 1))
+        # ComfyUI images are (B, H, W, C), select batch_index and permute to (C, H, W)
+        idx = min(batch_index, image_tensor.shape[0] - 1)
+        pil_img = to_pil(image_tensor[idx].permute(2, 0, 1))
         # Convert to base64
         buffered = io.BytesIO()
         pil_img.save(buffered, format="PNG")
@@ -90,6 +91,71 @@ def _convert_image_to_data_uri(image_tensor: torch.Tensor) -> str:
 
     except Exception as e:
         raise ValueError(f"Failed to convert image tensor to data URI: {str(e)}")
+
+
+def _get_handler_params(handler_class: type) -> set:
+    """Walk the full MRO to collect all explicitly-named __init__ params."""
+    params = set()
+    for klass in type.mro(handler_class):
+        if klass is object:
+            continue
+        init = klass.__dict__.get('__init__')
+        if init is None:
+            continue
+        try:
+            sig = inspect.signature(init)
+            for name, p in sig.parameters.items():
+                if name == 'self':
+                    continue
+                if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                    continue
+                params.add(name)
+        except (ValueError, TypeError):
+            continue
+    return params
+
+
+def _model_identity(model: dict, llama_kwargs: dict) -> tuple:
+    """Return a hashable identity tuple for the current model config."""
+    return (
+        model.get("model_path"),
+        model.get("chat_format"),
+        model.get("mmproj_model_path"),
+    )
+
+
+# Track currently-loaded model identity for persistent mode
+_global_llm_identity = None
+
+
+def _pdf_to_image_tensors(pdf_path: str, dpi: int = 150) -> torch.Tensor:
+    """Render each PDF page and return a stacked ComfyUI IMAGE tensor (B, H, W, C) float32."""
+    import fitz  # pymupdf
+    doc = fitz.open(pdf_path)
+    scale = dpi / 72.0
+    mat = fitz.Matrix(scale, scale)
+    pages = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
+        t = torch.frombuffer(bytearray(pix.samples), dtype=torch.uint8)
+        t = t.reshape(pix.height, pix.width, 3).float() / 255.0
+        pages.append(t)
+    doc.close()
+    if not pages:
+        raise RuntimeError("PDF has no pages.")
+    # Pad all pages to the same size (largest H × W) before stacking
+    max_h = max(p.shape[0] for p in pages)
+    max_w = max(p.shape[1] for p in pages)
+    padded = []
+    for p in pages:
+        h, w, c = p.shape
+        if h < max_h or w < max_w:
+            canvas = torch.zeros(max_h, max_w, c, dtype=p.dtype)
+            canvas[:h, :w] = p
+            p = canvas
+        padded.append(p)
+    return torch.stack(padded)  # (B, H, W, C)
+
 
 def _cleanup_global_llm(mode: str):
     """Helper function to cleanup the global LLM based on mode."""
@@ -321,13 +387,12 @@ class LlamaCPPEngine(ComfyNodeABC):
             # Create user message content
             user_content = prompt.strip()
 
-            # If vision is enabled and image is provided, convert image and create structured content
+            # If vision is enabled and image is provided, convert all batch images
             if vision_enabled and image is not None:
-                image_data_uri = _convert_image_to_data_uri(image)
                 user_content = [
-                    {"type": "image_url", "image_url": image_data_uri},
-                    {"type": "text", "text": prompt.strip()}
-                ]
+                    {"type": "image_url", "image_url": _convert_image_to_data_uri(image, i)}
+                    for i in range(image.shape[0])
+                ] + [{"type": "text", "text": prompt.strip()}]
 
             messages.append({"role": "user", "content": user_content})
 
@@ -352,27 +417,7 @@ class LlamaCPPEngine(ComfyNodeABC):
                     llama_kwargs["n_threads"] = max(1, os.cpu_count() or 4)
 
                 handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
-
-                # v0.3.30+: MTMDChatHandler uses **kwargs to RAISE on unexpected params.
-                # Walk the full MRO to collect all explicitly-named __init__ params across
-                # the entire inheritance chain. Only pass params that are explicitly declared.
-                handler_params = set()
-                for klass in type.mro(handler_class):
-                    if klass is object:
-                        continue
-                    init = klass.__dict__.get('__init__')
-                    if init is None:
-                        continue
-                    try:
-                        sig = inspect.signature(init)
-                        for name, p in sig.parameters.items():
-                            if name == 'self':
-                                continue
-                            if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                                continue
-                            handler_params.add(name)
-                    except (ValueError, TypeError):
-                        continue
+                handler_params = _get_handler_params(handler_class)
 
                 handler_kwargs = {}
                 # Always pass clip_model_path and verbose (present in all known handlers)
@@ -397,9 +442,14 @@ class LlamaCPPEngine(ComfyNodeABC):
                 llama_kwargs.pop("chat_format", None)
 
             # Pre-generation LLM management
+            # persistent mode: only skip reload if the model identity matches
+            current_identity = _model_identity(model, llama_kwargs)
             if memory_cleanup == "persistent":
-                if _global_llm is None:
+                global _global_llm_identity
+                if _global_llm is None or _global_llm_identity != current_identity:
+                    _cleanup_global_llm("close")
                     _global_llm = Llama(**llama_kwargs)
+                    _global_llm_identity = current_identity
             else:  # close or backend_free - always cleanup existing and create new
                 _cleanup_global_llm(memory_cleanup)
                 _global_llm = Llama(**llama_kwargs)
@@ -453,9 +503,8 @@ class LlamaCPPEngine(ComfyNodeABC):
             _cleanup_global_llm(memory_cleanup)
 
         except Exception as e:
-            response_text = f"Error generating response: {str(e)}"
-            thinking_text = ""
             print(f"LlamaCPP Engine Error: {str(e)}")
+            raise RuntimeError(f"LlamaCPP Engine Error: {str(e)}") from e
 
         return (response_text, thinking_text)
 
@@ -515,6 +564,78 @@ _FIRERED_OCR_PROMPT = """You are an AI assistant specialized in converting PDF i
         Please strictly follow these guidelines to ensure accuracy and consistency in the conversion. Your task is to accurately convert the content of the PDF image into Markdown format without adding any extra explanations or comments."""
 
 
+class PDFLoader(ComfyNodeABC):
+    """Load a PDF file and render all pages as a ComfyUI IMAGE batch."""
+
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        return {
+            "required": {
+                "pdf_path": ("STRING", {"default": "", "tooltip": "Absolute path to the PDF file (forward or back slashes both work on Windows)"}),
+            },
+            "optional": {
+                "dpi": ("INT", {"default": 150, "min": 72, "max": 600, "tooltip": "Render resolution. Higher = sharper image, more VRAM/memory needed."}),
+                "page_start": ("INT", {"default": 1, "min": 1, "tooltip": "First page to load (1-indexed)"}),
+                "page_end": ("INT", {"default": 0, "min": 0, "tooltip": "Last page to load (0 = all pages)"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("images", "page_count")
+    FUNCTION = "load_pdf"
+    CATEGORY = "LlamaCPP"
+
+    def load_pdf(self, pdf_path: str, dpi: int = 150, page_start: int = 1, page_end: int = 0) -> tuple:
+        pdf_path = pdf_path.strip()
+        if not pdf_path:
+            raise ValueError("pdf_path is empty.")
+        if not os.path.isfile(pdf_path):
+            raise FileNotFoundError(f"PDF not found: {pdf_path}")
+        try:
+            import fitz  # pymupdf
+        except ImportError:
+            raise ImportError("pymupdf is required. Install with: pip install pymupdf")
+
+        # Slice page range
+        import fitz as _fitz
+        doc = _fitz.open(pdf_path)
+        total = doc.page_count
+        doc.close()
+
+        start = max(0, page_start - 1)          # convert 1-indexed → 0-indexed
+        end = (total if page_end == 0 else min(page_end, total))
+        if start >= end:
+            raise ValueError(f"Invalid page range: start={page_start}, end={page_end}, total={total}")
+
+        # Render selected pages
+        import fitz as _fitz2
+        doc = _fitz2.open(pdf_path)
+        scale = dpi / 72.0
+        mat = _fitz2.Matrix(scale, scale)
+        pages = []
+        for i in range(start, end):
+            pix = doc[i].get_pixmap(matrix=mat, colorspace=_fitz2.csRGB, alpha=False)
+            t = torch.frombuffer(bytearray(pix.samples), dtype=torch.uint8)
+            t = t.reshape(pix.height, pix.width, 3).float() / 255.0
+            pages.append(t)
+        doc.close()
+        print(f"[PDFLoader] Loaded {len(pages)} page(s) from '{pdf_path}' at {dpi} DPI")
+
+        # Pad to common size and stack
+        max_h = max(p.shape[0] for p in pages)
+        max_w = max(p.shape[1] for p in pages)
+        padded = []
+        for p in pages:
+            h, w, c = p.shape
+            if h < max_h or w < max_w:
+                canvas = torch.zeros(max_h, max_w, c, dtype=p.dtype)
+                canvas[:h, :w] = p
+                p = canvas
+            padded.append(p)
+        images = torch.stack(padded)  # (B, H, W, C)
+        return (images, len(pages))
+
+
 class FireRedOCREngine(ComfyNodeABC):
     """Dedicated OCR node for FireRed-OCR GGUF models (Qwen3-VL-based).
 
@@ -533,7 +654,7 @@ class FireRedOCREngine(ComfyNodeABC):
         return {
             "required": {
                 "model": ("LLAMA_MODEL", {"tooltip": "FireRed-OCR model loaded via Llama CPP Model Loader (must include mmproj)"}),
-                "image": ("IMAGE", {"tooltip": "Document/page image to OCR"}),
+                "image": ("IMAGE", {"tooltip": "Document/page image(s) to OCR. Use PDFLoader to convert PDF pages."}),
             },
             "optional": {
                 "options": ("LLAMA_OPTIONS", {"tooltip": "Model options from Llama CPP Options node"}),
@@ -542,7 +663,6 @@ class FireRedOCREngine(ComfyNodeABC):
                     "default": "",
                     "tooltip": "Override the built-in OCR prompt. Leave empty to use the FireRed-OCR default prompt.",
                 }),
-                "n_ctx": ("INT", {"default": 32768, "min": 4096, "max": 131072, "tooltip": "Context window — must fit image tokens + prompt + output. VL images alone can eat 4k+ tokens."}),
                 "max_tokens": ("INT", {"default": 8192, "min": 128, "max": 65536, "tooltip": "Maximum tokens (documents need long output)"}),
                 "temperature": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "Lower = more deterministic OCR"}),
                 "memory_cleanup": (["close", "backend_free", "full_cleanup", "persistent"], {"default": "close", "tooltip": "Memory cleanup after generation"}),
@@ -561,7 +681,6 @@ class FireRedOCREngine(ComfyNodeABC):
         image: torch.Tensor,
         options: Dict[str, Any] = None,
         custom_prompt: str = "",
-        n_ctx: int = 32768,
         max_tokens: int = 8192,
         temperature: float = 0.1,
         memory_cleanup: str = "close",
@@ -584,51 +703,23 @@ class FireRedOCREngine(ComfyNodeABC):
 
             options = options or {}
             model_path = model["model_path"]
-
-            # Build message with image + OCR prompt
             prompt_text = custom_prompt.strip() if custom_prompt.strip() else _FIRERED_OCR_PROMPT
-            image_data_uri = _convert_image_to_data_uri(image)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": image_data_uri},
-                        {"type": "text", "text": prompt_text},
-                    ],
-                }
-            ]
 
-            # Llama init kwargs
-            llama_kwargs = {
-                "model_path": model_path,
-            }
+            # Split image batch into individual page tensors
+            page_images = [image[i].unsqueeze(0) for i in range(image.shape[0])]
+
+            # Build Llama kwargs from options
+            llama_kwargs = {"model_path": model_path}
             for k, v in options.items():
                 if not k.startswith("vision_"):
                     llama_kwargs[k] = v
 
-            # Vision handler — same logic as LlamaCPPEngine
+            # Vision handler
             if llama_kwargs.get("n_threads", -1) <= 0:
                 llama_kwargs["n_threads"] = max(1, os.cpu_count() or 4)
 
             handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
-
-            handler_params = set()
-            for klass in type.mro(handler_class):
-                if klass is object:
-                    continue
-                init = klass.__dict__.get('__init__')
-                if init is None:
-                    continue
-                try:
-                    sig = inspect.signature(init)
-                    for name, p in sig.parameters.items():
-                        if name == 'self':
-                            continue
-                        if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                            continue
-                        handler_params.add(name)
-                except (ValueError, TypeError):
-                    continue
+            handler_params = _get_handler_params(handler_class)
 
             handler_kwargs = {
                 "clip_model_path": model["mmproj_model_path"],
@@ -644,29 +735,50 @@ class FireRedOCREngine(ComfyNodeABC):
             llama_kwargs["chat_handler"] = chat_handler
 
             # LLM lifecycle
+            current_identity = _model_identity(model, llama_kwargs)
             if memory_cleanup == "persistent":
-                if _global_llm is None:
+                global _global_llm_identity
+                if _global_llm is None or _global_llm_identity != current_identity:
+                    _cleanup_global_llm("close")
                     _global_llm = Llama(**llama_kwargs)
+                    _global_llm_identity = current_identity
             else:
                 _cleanup_global_llm(memory_cleanup)
                 _global_llm = Llama(**llama_kwargs)
 
-            response = _global_llm.create_chat_completion(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                seed=seed,
-            )
+            # OCR each page individually and collect results
+            page_results = []
+            for page_idx, page_tensor in enumerate(page_images):
+                print(f"[FireRedOCR] Processing page {page_idx + 1}/{len(page_images)}...")
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": _convert_image_to_data_uri(page_tensor, 0)}
+                        ] + [{"type": "text", "text": prompt_text}],
+                    }
+                ]
+                response = _global_llm.create_chat_completion(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    seed=seed,
+                )
+                if not response or "choices" not in response or not response["choices"]:
+                    raise RuntimeError(f"No response generated for page {page_idx + 1}")
+                page_results.append(response["choices"][0]["message"]["content"] or "")
 
-            if not response or "choices" not in response or not response["choices"]:
-                raise RuntimeError("No response generated")
-
-            markdown_text = response["choices"][0]["message"]["content"] or ""
-
+            # Join pages with separator
+            if len(page_results) == 1:
+                markdown_text = page_results[0]
+            else:
+                markdown_text = "\n\n".join(
+                    f"<!-- Page {i + 1} -->\n{text}" for i, text in enumerate(page_results)
+                )
             _cleanup_global_llm(memory_cleanup)
 
         except Exception as e:
-            markdown_text = f"FireRed-OCR Error: {str(e)}"
             print(f"[FireRedOCR] Error: {str(e)}")
+            raise RuntimeError(f"FireRed-OCR Error: {str(e)}") from e
 
         return (markdown_text,)
