@@ -487,15 +487,27 @@ class LlamaCPPEngine(ComfyNodeABC):
 
             # Strip <think>...</think> blocks if requested
             # Also handles truncated output (think block never closed due to max_tokens)
+            # Also handles "orphan" </think>: model emits reasoning text before </think>
+            # without a matching <think> (the opening was injected via the prefilled
+            # assistant message, so it doesn't appear in response_text).
             thinking_text = ""
             if strip_thinking:
                 import re
-                # Extract all complete think blocks
+                # Case 1: bare </think> at the start (no opening <think> in response_text).
+                # Everything before the first </think> is thinking content.
+                orphan_match = re.match(r"^(.*?)</think>\s*", response_text, re.DOTALL)
+                if orphan_match and "<think>" not in response_text[:orphan_match.end()]:
+                    thinking_text = orphan_match.group(1).strip()
+                    response_text = response_text[orphan_match.end():]
+
+                # Case 2: extract all complete <think>...</think> blocks
                 think_blocks = re.findall(r"<think>(.*?)</think>", response_text, re.DOTALL)
-                thinking_text = "\n\n".join(b.strip() for b in think_blocks)
+                if think_blocks:
+                    extra = "\n\n".join(b.strip() for b in think_blocks)
+                    thinking_text = (thinking_text + "\n\n" + extra).strip() if thinking_text else extra
                 # Remove complete think blocks
                 response_text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL)
-                # Remove any dangling opening tag (truncated output, no closing tag)
+                # Case 3: dangling opening tag (truncated output, no closing tag)
                 response_text = re.sub(r"<think>.*$", "", response_text, flags=re.DOTALL)
                 response_text = response_text.strip()
 
