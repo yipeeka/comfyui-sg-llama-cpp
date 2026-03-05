@@ -1,7 +1,6 @@
 # comfyui-sg-llama-cpp
 
-ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vision models. It
-allows the user to generate text responses from prompts using llama.cpp.
+ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vision models. It allows the user to generate text responses from prompts using llama.cpp.
 
 ![Screenshot](assets/node_preview.png)
 
@@ -10,8 +9,10 @@ allows the user to generate text responses from prompts using llama.cpp.
 - Load and use GGUF models (including vision models)
 - Generate text prompts using llama.cpp
 - Support for multi-modal inputs (images)
+- Vision pipeline powered by `MTMDChatHandler` (llama-cpp-python ≥ v0.3.28)
+- Thinking/reasoning model support with `enable_thinking` toggle and `strip_thinking` output
+- Concurrent multimodal image decoding (ThreadPoolExecutor)
 - Memory management options
-- Integration with ComfyUI workflows
 
 ## Installation
 
@@ -37,38 +38,43 @@ Loads GGUF model files and prepares them for use.
 - **Required**:
   - `model_name`: Select the GGUF model file to load.
 - **Optional**:
-  - `chat_format`: Chat template to use (default: `llama-2`).
-  - `mmproj_model_name`: Multi-modal projector model for vision (default: `None`).
+  - `chat_format`: Chat template to use (default: `llama-2`). Vision formats are prefixed with `vision-` (e.g. `vision-qwen3vl`, `vision-qwen35`, `vision-llava15`).
+  - `mmproj_model_name`: Multi-modal projector model for vision (default: `None`). Required for vision inference.
 
 **Outputs**
 - `model`: The loaded Llama model object.
+
+> **Note**: At startup, detected vision handlers are printed to the console:
+> `[LlamaCPP] Detected vision handlers: ['vision-gemma3', 'vision-llava15', 'vision-qwen35', ...]`
+
+---
 
 ### LlamaCPPOptions
 Configures advanced parameters for the model.
 
 **Inputs**
 - **Optional**:
-  - `n_gpu_layers`: Number of layers to offload to GPU (default: `-1` for all).
-  - `n_ctx`: Context window size (default: `2048`).
-  - `n_threads`: CPU threads to use (default: `-1` for auto).
-  - `n_threads_batch`: Threads for batch processing (default: `-1` for auto).
+  - `n_gpu_layers`: Layers to offload to GPU VRAM. `0` = CPU only, `-1` = all layers on GPU (default: `-1`).
+  - `n_ctx`: Context window size. Larger = more memory (default: `2048`).
+  - `n_threads`: CPU threads to use. `-1` = auto (default: `-1`).
+  - `n_threads_batch`: Threads for batch processing. `-1` = auto (default: `-1`).
   - `n_batch`: Batch size (default: `512`).
   - `n_ubatch`: Micro-batch size (default: `512`).
   - `main_gpu`: Main GPU ID (default: `0`).
-  - `offload_kqv`: Offload K/Q/V to GPU (default: `Enabled`).
-  - `numa`: NUMA support (default: `Disabled`).
-  - `use_mmap`: Memory mapping (default: `Enabled`).
-  - `use_mlock`: Memory locking (default: `Disabled`).
-  - `verbose`: Verbose logging (default: `Disabled`).
-  - `vision_use_gpu`: Enable GPU for vision handler (default: `Enabled`).
-  - `vision_image_min_tokens`: Minimum image tokens (default: `-1`).
-  - `vision_image_max_tokens`: Maximum image tokens (default: `-1`).
-  - `vision_enable_thinking`: Enable thinking mode for GLMV models (default: `Disabled`).
-  - `vision_force_reasoning`: Force reasoning for QwenVL models (default: `Disabled`).
-  - `vision_add_vision_id`: Add vision ID for QwenVL models (default: `Enabled`).
+  - `offload_kqv`: Offload KV cache to GPU VRAM. Faster but uses more VRAM; disable if VRAM is tight (default: `Enabled`).
+  - `numa`: NUMA affinity (default: `Disabled`).
+  - `use_mmap`: Memory-mapped file loading (default: `Enabled`).
+  - `use_mlock`: Lock memory-mapped files in RAM (default: `Disabled`).
+  - `verbose`: Verbose llama.cpp logging (default: `Disabled`).
+  - `vision_use_gpu`: Use GPU for vision encoder (default: `Enabled`).
+  - `vision_image_min_tokens`: Minimum image tokens, `-1` for default (default: `-1`).
+  - `vision_image_max_tokens`: Maximum image tokens, `-1` for default (default: `-1`).
+  - `vision_enable_thinking`: Enable thinking mode for MiniCPM-V 4.5 (default: `Disabled`).
 
 **Outputs**
 - `options`: A configuration dictionary.
+
+---
 
 ### LlamaCPPEngine
 The main generation node.
@@ -78,23 +84,37 @@ The main generation node.
   - `model`: The model from `LlamaCPPModelLoader`.
   - `prompt`: The text prompt.
 - **Optional**:
-  - `image`: Input image for vision models.
+  - `image`: Input image for vision models (requires `vision-*` chat format + mmproj).
   - `options`: Options from `LlamaCPPOptions`.
   - `system_prompt`: System instruction (default: empty).
-  - `memory_cleanup`: Strategy to clean memory after generation (default: `close`).
+  - `memory_cleanup`: Memory strategy after generation (default: `close`).
+    - `close`: Free the model after each run.
+    - `backend_free`: Free model + llama backend.
+    - `full_cleanup`: Free model + backend + CUDA cache.
+    - `persistent`: Keep model loaded between runs (fastest for repeated use).
   - `response_format`: `text` or `json_object` (default: `text`).
-  - `max_tokens`: Max new tokens (default: `512`).
-  - `temperature`: Randomness (default: `0.2`).
+  - `enable_thinking`: Enable thinking/reasoning output for thinking models (Qwen3, Qwen3.5, QwQ, etc.). When disabled, injects an empty `<think></think>` prefix to force the model to skip reasoning (default: `Enabled`).
+  - `max_tokens`: Maximum tokens to generate (default: `512`).
+  - `temperature`: Sampling temperature (default: `0.2`).
   - `top_p`: Nucleus sampling (default: `0.95`).
   - `top_k`: Top-k sampling (default: `100`).
-  - `repeat_penalty`: Penalty for repetition (default: `1.0`).
-  - `seed`: Random seed (default: `-1`).
+  - `repeat_penalty`: Repetition penalty (default: `1.0`).
+  - `seed`: Random seed, `-1` for random (default: `-1`).
+  - `strip_thinking`: Strip `<think>...</think>` blocks from the `response` output. Also handles truncated thinking (no closing tag). The thinking content is available in the `thinking` output (default: `Disabled`).
 
 **Outputs**
-- `response`: The generated text.
+- `response`: The generated text (thinking stripped if `strip_thinking` is enabled).
+- `thinking`: The extracted thinking/reasoning content (empty if `strip_thinking` is disabled or model produced none).
+
+> **Tip for thinking models**: If output is only `<think>` content and gets cut off, it means `max_tokens` was exhausted before the model finished reasoning. Solutions:
+> - Increase `n_ctx` (e.g. 32768) and/or reduce `max_tokens`
+> - Set `enable_thinking` to `Disabled` to skip reasoning entirely
+> - Enable `strip_thinking` to always extract the final answer even from partial output
+
+---
 
 ### LlamaCPPMemoryCleanup
-Utility to manually free resources.
+Utility to manually free resources at a specific point in the workflow.
 
 **Inputs**
 - **Required**:
@@ -105,14 +125,15 @@ Utility to manually free resources.
 **Outputs**
 - `passthrough`: The input passed through unmodified.
 
+---
+
 ## Custom Model Folders
 
-By default, the node loads GGUF models from ComfyUI's `text_encoders` folder. You can optionally specify additional folders to load models from by creating a `config.json` file in the custom nodes directory.
+By default, the node loads GGUF models from ComfyUI's `text_encoders` folder. You can optionally specify additional folders with a `config.json` file.
 
 ### Configuration
 
-1. Create a file named `config.json` in the same directory as this README
-2. Add your custom model folders in the following JSON format:
+Create `config.json` in the custom nodes directory:
 
 ```json
 {
@@ -124,18 +145,29 @@ By default, the node loads GGUF models from ComfyUI's `text_encoders` folder. Yo
 }
 ```
 
-### Notes
-
-- The `config.json` file is **optional** - the node works without it
-- Paths can be absolute or relative
-- Both Windows (`C:\`) and Unix (`/`) style paths are supported
+- The file is **optional** — the node works without it
 - Non-existent paths are automatically filtered out
-- Models from all folders (ComfyUI's `text_encoders` + your custom folders) will appear in the model selection dropdown
-- See `config.example.json` for additional examples
+- Models from all folders appear in the model selection dropdown
+- See `config.example.json` for examples
+
+---
+
+## Vision Models
+
+Vision inference requires:
+1. A vision GGUF model (the LLM backbone)
+2. A matching `mmproj` GGUF file (the visual encoder projector)
+3. Selecting a `vision-*` chat format in `LlamaCPPModelLoader`
+
+Supported handlers are auto-detected at startup from the installed llama-cpp-python version. Supported models include: LLaVA 1.5/1.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5, MiniCPM-V 2.6/4.5, Gemma3, GLM-4V, Moondream, LFM2-VL, and more.
+
+> **n_threads for vision**: The vision pipeline uses multi-threaded image decoding. If `n_threads` is set to `-1` (auto), the node automatically sets it to `os.cpu_count()` to avoid a crash in `ThreadPoolExecutor`.
+
+---
 
 ## Requirements
 
-- llama-cpp-python (from https://github.com/JamePeng/llama-cpp-python, make sure to install the right version for your hardware and torch/cuda version)
+- llama-cpp-python ≥ v0.3.30 (from https://github.com/JamePeng/llama-cpp-python)
 
 ## License
 

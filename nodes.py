@@ -12,6 +12,11 @@ from llama_cpp.llama_chat_format import (
     Llava15ChatHandler,
     LlamaChatCompletionHandlerRegistry,
 )
+# v0.3.28+: MTMDChatHandler is the new base class for all multimodal handlers
+try:
+    from llama_cpp.llama_chat_format import MTMDChatHandler as _MTMDChatHandler
+except ImportError:
+    _MTMDChatHandler = None  # Older versions don't have this
 import folder_paths
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 from typing import Dict, Any, List, Type
@@ -97,50 +102,15 @@ def _cleanup_global_llm(mode: str):
         # Clean up chat_handler if it exists (for vision models)
         if hasattr(_global_llm, "chat_handler") and _global_llm.chat_handler is not None:
             try:
-                chat_handler = _global_llm.chat_handler
-                
-                # Primary Fix: Close ExitStack if present (used in newer llama-cpp-python versions)
-                # This triggers the callback to mtmd_free -> mtmd_cpp.mtmd_free
-                if hasattr(chat_handler, "_exit_stack") and chat_handler._exit_stack is not None:
-                    try:
-                        chat_handler._exit_stack.close()
-                    except Exception:
-                        pass
-
-                # Secondary Fix: Manual cleanup of attributes as fallback
-                # Attempt to find and close the CLIP/mmproj model embedded in the handler
-                clip_attrs = ["clip_model", "_clip_model", "mmproj", "_mmproj", "clf"]
-                
-                for attr_name in clip_attrs:
-                    if hasattr(chat_handler, attr_name):
-                        attr = getattr(chat_handler, attr_name)
-                        if attr is not None:
-                            # Try to close/free the model if a method exists
-                            if hasattr(attr, "close"):
-                                try:
-                                    attr.close()
-                                except Exception:
-                                    pass
-                            elif hasattr(attr, "__del__"):
-                                try:
-                                    attr.__del__()
-                                except Exception:
-                                    pass
-                                    
-                            # Explicitly remove the attribute to break reference cycles
-                            setattr(chat_handler, attr_name, None)
-                            
+                # v0.3.30+: close() safely handles _exit_stack internally (even on init failure)
+                # No need to manually close _exit_stack or clip_model attributes.
                 _global_llm.chat_handler.close()
             except Exception:
                 pass  # Ignore cleanup errors for chat_handler
-            
-            # Remove the handler callback/reference from the LLM if possible/accessible
+
             if hasattr(_global_llm, "chat_handler"):
                 del _global_llm.chat_handler
-            # _global_llm might not have chat_handler attribute in strict sense if it was just in kwargs,
-            # but we are cleaning up the attribute we accessed.
-            
-            gc.collect()
+
             gc.collect()
         try:
             _global_llm.close()
@@ -169,12 +139,24 @@ def _cleanup_global_llm(mode: str):
 # Mapping of chat formats to vision chat handlers (dynamically discovered)
 import llama_cpp.llama_chat_format as lcf
 
-VISION_HANDLERS = {}
-for name, obj in inspect.getmembers(lcf):
-    if inspect.isclass(obj) and issubclass(obj, lcf.Llava15ChatHandler):
-        vision_name = f"vision-{name.lower().replace('chathandler', '')}"
-        VISION_HANDLERS[vision_name] = obj
+# v0.3.28+: MTMDChatHandler is the new base; Llava15ChatHandler kept for backward compat.
+_base_vision_classes = tuple(filter(None, [
+    getattr(lcf, 'MTMDChatHandler', None),
+    getattr(lcf, 'Llava15ChatHandler', None),
+]))
 
+VISION_HANDLERS = {}
+if _base_vision_classes:
+    for name, obj in inspect.getmembers(lcf):
+        if (
+            inspect.isclass(obj)
+            and issubclass(obj, _base_vision_classes)
+            and obj not in _base_vision_classes
+        ):
+            vision_name = f"vision-{name.lower().replace('chathandler', '')}"
+            VISION_HANDLERS[vision_name] = obj
+
+print(f"[LlamaCPP] Detected vision handlers: {sorted(VISION_HANDLERS.keys())}")
 
 class LlamaCPPModelLoader(ComfyNodeABC):
     @classmethod
@@ -260,9 +242,7 @@ class LlamaCPPOptions(ComfyNodeABC):
                 "vision_use_gpu": (IO.BOOLEAN, {"default": True, "tooltip": "Vision: Enable GPU for vision handler", "label_on": "Enabled", "label_off": "Disabled"}),
                 "vision_image_min_tokens": ("INT", {"default": -1, "min": -1, "max": 16384, "tooltip": "Vision: Minimum image tokens (-1 for default)"}),
                 "vision_image_max_tokens": ("INT", {"default": -1, "min": -1, "max": 16384, "tooltip": "Vision: Maximum image tokens (-1 for default)"}),
-                "vision_enable_thinking": (IO.BOOLEAN, {"default": False, "tooltip": "Vision: Enable thinking (GLMV)", "label_on": "Enabled", "label_off": "Disabled"}),
-                "vision_force_reasoning": (IO.BOOLEAN, {"default": False, "tooltip": "Vision: Force reasoning (QwenVL)", "label_on": "Enabled", "label_off": "Disabled"}),
-                "vision_add_vision_id": (IO.BOOLEAN, {"default": True, "tooltip": "Vision: Add vision ID (QwenVL)", "label_on": "Enabled", "label_off": "Disabled"}),
+                "vision_enable_thinking": (IO.BOOLEAN, {"default": False, "tooltip": "Vision: Enable thinking (MiniCPMv45)", "label_on": "Enabled", "label_off": "Disabled"}),
             }
         }
 
@@ -296,21 +276,23 @@ class LlamaCPPEngine(ComfyNodeABC):
                 "system_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "System prompt"}),
                 "memory_cleanup": (["close", "backend_free", "full_cleanup", "persistent"], {"default": "close", "tooltip": "Memory cleanup method after generation"}),
                 "response_format": (["text", "json_object"], {"default": "text", "tooltip": "Output format (json_object forces valid JSON)"}),
+                "enable_thinking": (IO.BOOLEAN, {"default": True, "tooltip": "Enable thinking/reasoning (Qwen3, QwQ, etc.). False injects empty <think> block to skip reasoning.", "label_on": "Enabled", "label_off": "Disabled"}),
                 "max_tokens": ("INT", {"default": 512, "min": 1, "max": 262144, "tooltip": "Maximum tokens to generate"}),
                 "temperature": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Sampling temperature"}),
                 "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Top-p sampling"}),
                 "top_k": ("INT", {"default": 100, "min": 0, "max": 400, "tooltip": "Top-k sampling"}),
                 "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 2.0, "step": 0.01, "tooltip": "Repeat penalty"}),
                 "seed": ("INT", {"default": -1, "min": -1, "tooltip": "Random seed (-1 for random)"}),
+                "strip_thinking": (IO.BOOLEAN, {"default": False, "tooltip": "Strip <think>...</think> blocks from output (thinking models like QwQ, Qwen3)", "label_on": "Strip", "label_off": "Keep"}),
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("response",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("response", "thinking")
     FUNCTION = "generate"
     CATEGORY = "LlamaCPP"
 
-    def generate(self, model: Dict[str, Any], prompt: str, image: torch.Tensor = None, options: Dict[str, Any] = None, system_prompt: str = "", memory_cleanup: str = "close", response_format: str = "text", max_tokens: int = 128, temperature: float = 0.8, top_p: float = 0.95, top_k: int = 40, repeat_penalty: float = 1.1, seed: int = -1) -> tuple:
+    def generate(self, model: Dict[str, Any], prompt: str, image: torch.Tensor = None, options: Dict[str, Any] = None, system_prompt: str = "", memory_cleanup: str = "close", response_format: str = "text", enable_thinking: bool = True, max_tokens: int = 128, temperature: float = 0.8, top_p: float = 0.95, top_k: int = 40, repeat_penalty: float = 1.1, seed: int = -1, strip_thinking: bool = False) -> tuple:
         global _global_llm
         try:
             # Validate inputs
@@ -362,20 +344,42 @@ class LlamaCPPEngine(ComfyNodeABC):
 
             # Handle vision models: use chat_handler based on chat_format
             if vision_enabled:
-                handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
-                
-                # Dynamically get parameters from the base class and actual class (Llava15ChatHandler)
-                base_sig = inspect.signature(Llava15ChatHandler)
-                handler_params = set(base_sig.parameters.keys())
-                handler_sig = inspect.signature(handler_class)
-                handler_params.update(handler_sig.parameters.keys())
-                
-                handler_kwargs = {
-                    "clip_model_path": model["mmproj_model_path"],
-                    "verbose": options.get("verbose", False),
-                }
+                # Workaround: MTMDChatHandler._process_mtmd_prompt computes
+                # max_workers = min(llama.n_threads, len(image_urls))
+                # which crashes ThreadPoolExecutor when n_threads is -1 (auto).
+                # Ensure n_threads is always a positive integer for vision mode.
+                if llama_kwargs.get("n_threads", -1) <= 0:
+                    llama_kwargs["n_threads"] = max(1, os.cpu_count() or 4)
 
-                # Process vision_ prefixed options
+                handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
+
+                # v0.3.30+: MTMDChatHandler uses **kwargs to RAISE on unexpected params.
+                # Walk the full MRO to collect all explicitly-named __init__ params across
+                # the entire inheritance chain. Only pass params that are explicitly declared.
+                handler_params = set()
+                for klass in type.mro(handler_class):
+                    if klass is object:
+                        continue
+                    init = klass.__dict__.get('__init__')
+                    if init is None:
+                        continue
+                    try:
+                        sig = inspect.signature(init)
+                        for name, p in sig.parameters.items():
+                            if name == 'self':
+                                continue
+                            if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                                continue
+                            handler_params.add(name)
+                    except (ValueError, TypeError):
+                        continue
+
+                handler_kwargs = {}
+                # Always pass clip_model_path and verbose (present in all known handlers)
+                handler_kwargs["clip_model_path"] = model["mmproj_model_path"]
+                handler_kwargs["verbose"] = options.get("verbose", False)
+
+                # Process vision_ prefixed options — only include if handler supports them
                 for k, v in options.items():
                     if k.startswith("vision_"):
                         param_name = k.replace("vision_", "")
@@ -383,6 +387,11 @@ class LlamaCPPEngine(ComfyNodeABC):
                             handler_kwargs[param_name] = v
 
                 chat_handler = handler_class(**handler_kwargs)
+
+                # Inject enable_thinking into vision handler's extra_template_arguments
+                if hasattr(chat_handler, "extra_template_arguments"):
+                    chat_handler.extra_template_arguments["enable_thinking"] = enable_thinking
+
                 llama_kwargs["chat_handler"] = chat_handler
                 # Remove chat_format when using vision handler
                 llama_kwargs.pop("chat_format", None)
@@ -398,9 +407,19 @@ class LlamaCPPEngine(ComfyNodeABC):
             # Prepare response_format parameter
             response_format_param = {"type": response_format} if response_format is not None else None
 
+            # For text models: implement enable_thinking=false via partial assistant prefix trick.
+            # Pre-fills an empty <think> block so the model skips reasoning entirely.
+            # Equivalent to --chat-template-kwargs '{"enable_thinking":false}' in llama-server.
+            completion_messages = list(messages)
+            if not enable_thinking and not vision_enabled:
+                completion_messages.append({
+                    "role": "assistant",
+                    "content": "<think>\n\n</think>\n\n"
+                })
+
             # Generate response using global LLM
             response = _global_llm.create_chat_completion(
-                messages=messages,
+                messages=completion_messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -414,16 +433,31 @@ class LlamaCPPEngine(ComfyNodeABC):
             if not response or "choices" not in response or not response["choices"]:
                 raise RuntimeError("No response generated by the model")
 
-            response_text = response["choices"][0]["message"]["content"]
+            response_text = response["choices"][0]["message"]["content"] or ""
+
+            # Strip <think>...</think> blocks if requested
+            # Also handles truncated output (think block never closed due to max_tokens)
+            thinking_text = ""
+            if strip_thinking:
+                import re
+                # Extract all complete think blocks
+                think_blocks = re.findall(r"<think>(.*?)</think>", response_text, re.DOTALL)
+                thinking_text = "\n\n".join(b.strip() for b in think_blocks)
+                # Remove complete think blocks
+                response_text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL)
+                # Remove any dangling opening tag (truncated output, no closing tag)
+                response_text = re.sub(r"<think>.*$", "", response_text, flags=re.DOTALL)
+                response_text = response_text.strip()
 
             # Post-generation memory cleanup
             _cleanup_global_llm(memory_cleanup)
 
         except Exception as e:
             response_text = f"Error generating response: {str(e)}"
+            thinking_text = ""
             print(f"LlamaCPP Engine Error: {str(e)}")
 
-        return (response_text,)
+        return (response_text, thinking_text)
 
 
 class LlamaCPPMemoryCleanup(ComfyNodeABC):
