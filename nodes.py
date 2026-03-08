@@ -337,12 +337,14 @@ class LlamaCPPEngine(ComfyNodeABC):
                 "prompt": ("STRING", {"multiline": True, "tooltip": "User prompt for chat completion"}),
             },
             "optional": {
-                "image": ("IMAGE", {"tooltip": "Input image for vision models"}),
+                "image": ("IMAGE", {"tooltip": "Input image(s) / video frames batch for vision models"}),
                 "options": ("LLAMA_OPTIONS", {"tooltip": "Model options from Options node"}),
                 "system_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "System prompt"}),
                 "memory_cleanup": (["close", "backend_free", "full_cleanup", "persistent"], {"default": "close", "tooltip": "Memory cleanup method after generation"}),
                 "response_format": (["text", "json_object"], {"default": "text", "tooltip": "Output format (json_object forces valid JSON)"}),
                 "enable_thinking": (IO.BOOLEAN, {"default": True, "tooltip": "Enable thinking/reasoning (Qwen3, QwQ, etc.). False injects empty <think> block to skip reasoning.", "label_on": "Enabled", "label_off": "Disabled"}),
+                "is_video": (IO.BOOLEAN, {"default": False, "tooltip": "Treat the IMAGE input as a video frame batch: uniformly sample video_max_frames and send them all to the vision model.", "label_on": "Video", "label_off": "Image"}),
+                "video_max_frames": ("INT", {"default": 8, "min": 1, "max": 256, "tooltip": "Maximum number of frames to sample from the video batch (uniform sampling)."}),
                 "max_tokens": ("INT", {"default": 512, "min": 1, "max": 262144, "tooltip": "Maximum tokens to generate"}),
                 "temperature": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Sampling temperature"}),
                 "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Top-p sampling"}),
@@ -358,7 +360,7 @@ class LlamaCPPEngine(ComfyNodeABC):
     FUNCTION = "generate"
     CATEGORY = "LlamaCPP"
 
-    def generate(self, model: Dict[str, Any], prompt: str, image: torch.Tensor = None, options: Dict[str, Any] = None, system_prompt: str = "", memory_cleanup: str = "close", response_format: str = "text", enable_thinking: bool = True, max_tokens: int = 128, temperature: float = 0.8, top_p: float = 0.95, top_k: int = 40, repeat_penalty: float = 1.1, seed: int = -1, strip_thinking: bool = False) -> tuple:
+    def generate(self, model: Dict[str, Any], prompt: str, image: torch.Tensor = None, options: Dict[str, Any] = None, system_prompt: str = "", memory_cleanup: str = "close", response_format: str = "text", enable_thinking: bool = True, is_video: bool = False, video_max_frames: int = 8, max_tokens: int = 128, temperature: float = 0.8, top_p: float = 0.95, top_k: int = 40, repeat_penalty: float = 1.1, seed: int = -1, strip_thinking: bool = False) -> tuple:
         global _global_llm
         try:
             # Validate inputs
@@ -387,11 +389,22 @@ class LlamaCPPEngine(ComfyNodeABC):
             # Create user message content
             user_content = prompt.strip()
 
-            # If vision is enabled and image is provided, convert all batch images
+            # If vision is enabled and image is provided, handle image or video frames
             if vision_enabled and image is not None:
+                total_frames = image.shape[0]
+                if is_video and total_frames > 1:
+                    # Uniform frame sampling
+                    if total_frames <= video_max_frames:
+                        indices = list(range(total_frames))
+                    else:
+                        import numpy as np
+                        indices = [int(round(i)) for i in np.linspace(0, total_frames - 1, video_max_frames)]
+                    print(f"[LlamaCPP] Video mode: sampling {len(indices)} frames from {total_frames} total (indices: {indices})")
+                else:
+                    indices = list(range(total_frames))
                 user_content = [
                     {"type": "image_url", "image_url": _convert_image_to_data_uri(image, i)}
-                    for i in range(image.shape[0])
+                    for i in indices
                 ] + [{"type": "text", "text": prompt.strip()}]
 
             messages.append({"role": "user", "content": user_content})

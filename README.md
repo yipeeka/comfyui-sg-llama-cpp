@@ -1,6 +1,6 @@
 # comfyui-sg-llama-cpp
 
-ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vision models and document OCR. Allows generating text responses from prompts using llama.cpp.
+ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vision models, video analysis, and document OCR. Allows generating text responses from prompts using llama.cpp.
 
 ![Screenshot](assets/node_preview.png)
 
@@ -9,6 +9,7 @@ ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vi
 - Load and use GGUF models (including vision models)
 - Generate text prompts using llama.cpp
 - Support for multi-modal inputs (multiple images per request)
+- **Video analysis**: feed a video frame batch from ComfyUI's native Video Loader — uniformly sample N frames and send them all to the vision model
 - Vision pipeline powered by `MTMDChatHandler` (llama-cpp-python ≥ v0.3.28)
 - Thinking/reasoning model support with `enable_thinking` toggle and `strip_thinking` output
 - Concurrent multimodal image decoding (ThreadPoolExecutor)
@@ -91,7 +92,7 @@ The main generation node.
   - `model`: The model from `LlamaCPPModelLoader`.
   - `prompt`: The text prompt.
 - **Optional**:
-  - `image`: Input image(s) for vision models. Accepts a full IMAGE batch — all images are sent to the model in a single request (requires `vision-*` chat format + mmproj).
+  - `image`: Input image(s) / video frames batch for vision models. Accepts a full IMAGE batch (requires `vision-*` chat format + mmproj).
   - `options`: Options from `LlamaCPPOptions`.
   - `system_prompt`: System instruction (default: empty).
   - `memory_cleanup`: Memory strategy after generation (default: `close`).
@@ -101,6 +102,8 @@ The main generation node.
     - `persistent`: Keep model loaded between runs (fastest for repeated use). Automatically reloads if the model changes.
   - `response_format`: `text` or `json_object` (default: `text`).
   - `enable_thinking`: Enable thinking/reasoning output for thinking models (Qwen3, Qwen3.5, QwQ, etc.). When disabled, injects an empty `<think></think>` prefix to force the model to skip reasoning (default: `Enabled`).
+  - `is_video`: Treat the `image` input as a **video frame batch**. When enabled, frames are uniformly sampled (up to `video_max_frames`) before being sent to the model. Connect a ComfyUI Video Loader's output directly to `image` and enable this toggle (default: `Disabled`).
+  - `video_max_frames`: Maximum number of frames to sample from the video batch. Frames are picked at uniform intervals across the full batch. Keep low to avoid context overflow — each frame consumes hundreds to thousands of tokens (default: `8`, range: `1–256`).
   - `max_tokens`: Maximum tokens to generate (default: `512`).
   - `temperature`: Sampling temperature (default: `0.2`).
   - `top_p`: Nucleus sampling (default: `0.95`).
@@ -223,6 +226,14 @@ Vision inference requires:
 Supported handlers are auto-detected at startup from the installed llama-cpp-python version. Supported models include: LLaVA 1.5/1.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5, MiniCPM-V 2.6/4.5, Gemma3, GLM-4V, Moondream, LFM2-VL, and more.
 
 **Multiple images**: All images in a ComfyUI IMAGE batch are sent to the model in a single request. Use `PDF Loader` or the native `Load Images` node to build multi-image batches.
+
+**Video analysis**: ComfyUI's Video Loader outputs an IMAGE batch of frames — connect it directly to the `image` input of `LlamaCPPEngine` and enable `is_video`. The node uniformly samples up to `video_max_frames` frames from the batch and sends them all to the vision model in one request.
+
+```
+Load Video (Upload) → LlamaCPP Engine (is_video=True, video_max_frames=8) → Show Text
+```
+
+> **Context size**: Each sampled frame may consume hundreds to thousands of tokens. Set `n_ctx` to at least `8192`–`32768` in `LlamaCPPOptions` when using video mode.
 
 > **n_threads for vision**: The vision pipeline uses multi-threaded image decoding. If `n_threads` is set to `-1` (auto), the node automatically sets it to `os.cpu_count()` to avoid a crash in `ThreadPoolExecutor`.
 
