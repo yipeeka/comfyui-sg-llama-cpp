@@ -1,4 +1,4 @@
-from .nodes import LlamaCPPModelLoader, LlamaCPPOptions, LlamaCPPEngine, LlamaCPPMemoryCleanup, FireRedOCREngine, PDFLoader
+from .nodes import LlamaCPPModelLoader, LlamaCPPOptions, LlamaCPPEngine, LlamaCPPMemoryCleanup, FireRedOCREngine, PDFLoader, MarkdownFigureEmbedder
 
 NODE_CLASS_MAPPINGS = {
     "LlamaCPPModelLoader": LlamaCPPModelLoader,
@@ -7,6 +7,7 @@ NODE_CLASS_MAPPINGS = {
     "LlamaCPPMemoryCleanup": LlamaCPPMemoryCleanup,
     "FireRedOCREngine": FireRedOCREngine,
     "PDFLoader": PDFLoader,
+    "MarkdownFigureEmbedder": MarkdownFigureEmbedder,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -16,4 +17,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LlamaCPPMemoryCleanup": "Llama CPP Memory Cleanup",
     "FireRedOCREngine": "FireRed OCR Engine",
     "PDFLoader": "PDF Loader",
+    "MarkdownFigureEmbedder": "Markdown Figure Embedder",
 }

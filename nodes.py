@@ -807,3 +807,369 @@ class FireRedOCREngine(ComfyNodeABC):
             raise RuntimeError(f"FireRed-OCR Error: {str(e)}") from e
 
         return (markdown_text,)
+
+
+# ---------------------------------------------------------------------------
+# Prompt for the figure-detection VLM call
+# ---------------------------------------------------------------------------
+_FIGURE_DETECT_PROMPT = """\
+Look at this document image. Find all embedded photographs \
+(real photographic images, NOT bar/line charts, NOT decorative borders, NOT text blocks).
+Number them in reading order (top-to-bottom, left-to-right).
+For each photograph:
+- The bounding box must tightly surround ONLY the visual photo pixels.
+- Do NOT include any caption text, figure number, or surrounding whitespace in the bounding box.
+- Use pixel-accurate coordinates expressed as fractions of the FULL image dimensions.
+Return a JSON array. Each element must have:
+  "index": 1-based integer
+  "description": one-sentence caption of the photo content
+  "x": left  edge of photo as fraction of image width  (0.0–1.0)
+  "y": top   edge of photo as fraction of image height (0.0–1.0)
+  "w": width  of photo as fraction of image width      (0.0–1.0)
+  "h": height of photo as fraction of image height     (0.0–1.0)
+If no photographs are found, return: []
+Return ONLY the raw JSON array. No markdown fences, no explanation."""
+
+
+def _strip_thinking_and_parse_json(raw: str) -> list:
+    """Strip <think>...</think> (and orphan </think>) then parse JSON.
+
+    Handles the case where Qwen-VL / FireRed-OCR prefixes the answer with a
+    (possibly empty) reasoning block before the actual JSON payload.
+    """
+    import json, re
+
+    # Remove complete <think>...</think> blocks
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    # Remove orphan </think> (model skipped the opening tag)
+    raw = re.sub(r".*?</think>", "", raw, flags=re.DOTALL)
+    # Strip markdown code fences
+    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
+    raw = re.sub(r"\n?```$", "", raw)
+    raw = raw.strip()
+
+    if not raw:
+        return []
+
+    parsed = json.loads(raw)
+
+    # Unwrap common dict wrappers e.g. {"figures": [...]}
+    if isinstance(parsed, dict):
+        for key in ("regions", "figures", "images", "items", "results"):
+            if key in parsed and isinstance(parsed[key], list):
+                return parsed[key]
+        # Fall back to first list value
+        for v in parsed.values():
+            if isinstance(v, list):
+                return v
+        return []
+
+    return parsed if isinstance(parsed, list) else []
+
+
+def _refine_photo_bbox(
+    src: torch.Tensor,
+    x1: int, y1: int, x2: int, y2: int,
+    expand: float = 0.15,
+    low_var_pct: float = 25.0,
+) -> tuple[int, int, int, int]:
+    """Tighten a coarse VLM bounding box to the actual photo pixels.
+
+    Photos have high colour variance per row/column; blank page margins and
+    caption text rows have very low variance (mostly white or uniform colour).
+
+    Parameters
+    ----------
+    src        : (H, W, C) float32 tensor for the full page.
+    x1,y1,x2,y2 : coarse pixel bbox from VLM.
+    expand     : fraction to expand the search window before scanning inward.
+    low_var_pct: rows/cols whose variance is below this percentile of the search
+                 window are considered non-photo and are trimmed.
+    """
+    import numpy as np
+
+    H, W, _ = src.shape
+    ph, pw = y2 - y1, x2 - x1
+
+    # Expand search window
+    ey, ex = int(ph * expand), int(pw * expand)
+    sy1 = max(0, y1 - ey)
+    sy2 = min(H, y2 + ey)
+    sx1 = max(0, x1 - ex)
+    sx2 = min(W, x2 + ex)
+
+    region = src[sy1:sy2, sx1:sx2, :].numpy()  # (rH, rW, C)
+
+    # Row-wise variance (mean over width and channels)
+    row_var = region.var(axis=(1, 2))          # (rH,)
+    col_var = region.var(axis=(0, 2))          # (rW,)
+
+    row_thresh = np.percentile(row_var, low_var_pct)
+    col_thresh = np.percentile(col_var, low_var_pct)
+
+    photo_rows = np.where(row_var > row_thresh)[0]
+    photo_cols = np.where(col_var > col_thresh)[0]
+
+    if len(photo_rows) == 0 or len(photo_cols) == 0:
+        return x1, y1, x2, y2  # fallback: return original
+
+    ry1 = sy1 + int(photo_rows[0])
+    ry2 = sy1 + int(photo_rows[-1]) + 1
+    rx1 = sx1 + int(photo_cols[0])
+    rx2 = sx1 + int(photo_cols[-1]) + 1
+
+    return rx1, ry1, rx2, ry2
+
+
+class MarkdownFigureEmbedder(ComfyNodeABC):
+    """Detect embedded photos in a document image via VLM and embed them into
+    the OCR markdown output as base64 data-URIs.
+
+    Works in two modes:
+    - **With placeholders**: if the OCR markdown contains ``![FIGURE_1]``,
+      ``![FIGURE_2]`` … the corresponding crops are inserted in-place.
+    - **Without placeholders** (normal FireRed-OCR output): figures are
+      appended at the end of the markdown under a ``---`` separator.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        return {
+            "required": {
+                "model": ("LLAMA_MODEL", {"tooltip": "Vision-capable model with mmproj (same as OCR)"}),
+                "image": ("IMAGE", {"tooltip": "Source document image (same page sent to OCR)"}),
+                "markdown": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "tooltip": "Markdown from FireRedOCREngine",
+                    },
+                ),
+            },
+            "optional": {
+                "options": ("LLAMA_OPTIONS", {"tooltip": "Model options"}),
+                "memory_cleanup": (
+                    ["close", "backend_free", "full_cleanup", "persistent"],
+                    {"default": "close"},
+                ),
+                "padding": ("INT", {"default": 0, "min": -512, "max": 512,
+                                    "tooltip": "Pixels to add (positive) or remove (negative) around each crop"}),
+                "image_format": (["png", "jpeg"], {"default": "jpeg",
+                                                   "tooltip": "JPEG is smaller; PNG is lossless"}),
+                "jpeg_quality": ("INT", {"default": 85, "min": 1, "max": 100}),
+                "batch_index": ("INT", {"default": 0, "min": 0,
+                                        "tooltip": "Page index in image batch (0-indexed)"}),
+                "temperature": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01,
+                                          "tooltip": "Detection temperature (0.0 = fully deterministic)"}),
+                "seed": ("INT", {"default": -1, "min": -1}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE")
+    RETURN_NAMES = ("markdown", "figure_images")
+    FUNCTION = "embed"
+    CATEGORY = "LlamaCPP"
+
+    @staticmethod
+    def _tensor_to_b64(crop: torch.Tensor, fmt: str, quality: int) -> str:
+        from torchvision.transforms.functional import to_pil_image
+        pil = to_pil_image(crop[0].permute(2, 0, 1))
+        buf = io.BytesIO()
+        if fmt == "jpeg":
+            pil = pil.convert("RGB")
+            pil.save(buf, format="JPEG", quality=quality)
+            mime = "image/jpeg"
+        else:
+            pil.save(buf, format="PNG")
+            mime = "image/png"
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        buf.close()
+        return f"data:{mime};base64,{b64}"
+
+    def embed(
+        self,
+        model: Dict[str, Any],
+        image: torch.Tensor,
+        markdown: str,
+        options: Dict[str, Any] = None,
+        memory_cleanup: str = "close",
+        padding: int = 4,
+        image_format: str = "jpeg",
+        jpeg_quality: int = 85,
+        batch_index: int = 0,
+        temperature: float = 0.0,
+        seed: int = -1,
+    ) -> tuple:
+        import re
+        global _global_llm
+
+        try:
+            if not isinstance(model, dict) or "model_path" not in model:
+                raise ValueError("Invalid model — connect a Llama CPP Model Loader")
+            if "mmproj_model_path" not in model:
+                raise ValueError("MarkdownFigureEmbedder requires a vision model with mmproj")
+
+            chat_format = model.get("chat_format", "")
+            if not chat_format.startswith("vision-"):
+                raise ValueError(
+                    f"chat_format '{chat_format}' is not a vision handler. "
+                    "Select a 'vision-*' format in the Model Loader."
+                )
+
+            options = options or {}
+            model_path = model["model_path"]
+
+            # Check for FIGURE_N placeholders (FireRed-OCR typically won't emit them)
+            import re as _re
+            placeholder_indices = [int(m) for m in _re.findall(r"!\[FIGURE_(\d+)\]", markdown)]
+            has_placeholders = bool(placeholder_indices)
+            print(
+                f"[MarkdownFigureEmbedder] {'Found ' + str(len(placeholder_indices)) + ' FIGURE_N placeholder(s).' if has_placeholders else 'No placeholders — figures will be appended.'}"
+            )
+
+            # Build Llama kwargs
+            llama_kwargs = {"model_path": model_path}
+            for k, v in options.items():
+                if not k.startswith("vision_"):
+                    llama_kwargs[k] = v
+
+            if llama_kwargs.get("n_threads", -1) <= 0:
+                llama_kwargs["n_threads"] = max(1, os.cpu_count() or 4)
+
+            handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
+            handler_params = _get_handler_params(handler_class)
+            handler_kwargs = {
+                "clip_model_path": model["mmproj_model_path"],
+                "verbose": options.get("verbose", False),
+            }
+            for k, v in options.items():
+                if k.startswith("vision_"):
+                    pname = k.replace("vision_", "")
+                    if pname in handler_params:
+                        handler_kwargs[pname] = v
+
+            chat_handler = handler_class(**handler_kwargs)
+            llama_kwargs["chat_handler"] = chat_handler
+
+            current_identity = _model_identity(model, llama_kwargs)
+            if memory_cleanup == "persistent":
+                global _global_llm_identity
+                if _global_llm is None or _global_llm_identity != current_identity:
+                    _cleanup_global_llm("close")
+                    _global_llm = Llama(**llama_kwargs)
+                    _global_llm_identity = current_identity
+            else:
+                _cleanup_global_llm(memory_cleanup)
+                _global_llm = Llama(**llama_kwargs)
+
+            # VLM detection call
+            idx = min(batch_index, image.shape[0] - 1)
+            page_tensor = image[idx].unsqueeze(0)
+            detect_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": _convert_image_to_data_uri(page_tensor, 0)},
+                        {"type": "text", "text": _FIGURE_DETECT_PROMPT},
+                    ],
+                },
+                # Prefill an empty <think> block so the model skips reasoning
+                # and outputs JSON directly (same trick used in LlamaCPPEngine).
+                {"role": "assistant", "content": "<think>\n\n</think>\n\n"},
+            ]
+            print("[MarkdownFigureEmbedder] Running figure detection VLM call...")
+            det_response = _global_llm.create_chat_completion(
+                messages=detect_messages,
+                max_tokens=1024,
+                temperature=temperature,
+                seed=seed,
+            )
+            raw_json = det_response["choices"][0]["message"]["content"] or ""
+            print(f"[MarkdownFigureEmbedder] Raw VLM response: {raw_json[:300]}")
+
+            # Parse: strip <think> blocks FIRST, then parse JSON
+            try:
+                regions = _strip_thinking_and_parse_json(raw_json)
+            except Exception as parse_err:
+                print(f"[MarkdownFigureEmbedder] JSON parse error: {parse_err}")
+                regions = []
+
+            print(f"[MarkdownFigureEmbedder] Detected {len(regions)} figure(s).")
+
+            if not regions:
+                print("[MarkdownFigureEmbedder] No figures detected — returning markdown unchanged.")
+                _cleanup_global_llm(memory_cleanup)
+                return (markdown, image)
+
+            # Crop regions
+            _, H, W, C = image.shape
+            src = image[idx]
+            figure_map: dict[int, tuple] = {}  # fig_idx → (crop, desc, data_uri)
+
+            for i, r in enumerate(regions):
+                try:
+                    fig_idx = int(r.get("index", i + 1))
+                    x1 = int(float(r["x"]) * W) - padding
+                    y1 = int(float(r["y"]) * H) - padding
+                    x2 = int((float(r["x"]) + float(r["w"])) * W) + padding
+                    y2 = int((float(r["y"]) + float(r["h"])) * H) + padding
+                except (KeyError, TypeError, ValueError) as exc:
+                    print(f"[MarkdownFigureEmbedder] Skipping region {i}: {exc}")
+                    continue
+
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(W, x2), min(H, y2)
+                if x2 <= x1 or y2 <= y1:
+                    print(f"[MarkdownFigureEmbedder] FIGURE_{fig_idx}: zero-size, skipping.")
+                    continue
+
+                crop = src[y1:y2, x1:x2, :].unsqueeze(0)
+                desc = r.get("description", f"Figure {fig_idx}")
+                data_uri = self._tensor_to_b64(crop, image_format, jpeg_quality)
+                figure_map[fig_idx] = (crop, desc, data_uri)
+                print(f"[MarkdownFigureEmbedder] FIGURE_{fig_idx}: '{desc}' → pixel [{x1},{y1},{x2},{y2}]")
+
+            if not figure_map:
+                print("[MarkdownFigureEmbedder] All regions invalid — returning markdown unchanged.")
+                _cleanup_global_llm(memory_cleanup)
+                return (markdown, image)
+
+            # Embed: replace placeholders or append
+            if has_placeholders:
+                def _repl(m: _re.Match) -> str:
+                    n = int(m.group(1))
+                    if n in figure_map:
+                        _, desc, data_uri = figure_map[n]
+                        return f"\n\n![{desc}]({data_uri})\n\n"
+                    return m.group(0)
+                result_markdown = _re.sub(r"!\[FIGURE_(\d+)\]", _repl, markdown)
+            else:
+                fig_section = "\n\n---\n\n"
+                for fidx in sorted(figure_map):
+                    _, desc, data_uri = figure_map[fidx]
+                    fig_section += f"![{desc}]({data_uri})\n\n*{desc}*\n\n"
+                result_markdown = markdown.rstrip() + fig_section
+
+            # Build IMAGE batch output
+            sorted_crops = [figure_map[k][0] for k in sorted(figure_map)]
+            max_h = max(c.shape[1] for c in sorted_crops)
+            max_w = max(c.shape[2] for c in sorted_crops)
+            padded_out = []
+            for c in sorted_crops:
+                ch, cw = c.shape[1], c.shape[2]
+                if ch == max_h and cw == max_w:
+                    padded_out.append(c)
+                else:
+                    canvas = torch.zeros(1, max_h, max_w, C, dtype=c.dtype)
+                    canvas[0, :ch, :cw] = c[0]
+                    padded_out.append(canvas)
+            figure_images = torch.cat(padded_out, dim=0)
+
+            _cleanup_global_llm(memory_cleanup)
+
+        except Exception as e:
+            print(f"[MarkdownFigureEmbedder] Error: {e}")
+            raise RuntimeError(f"MarkdownFigureEmbedder Error: {e}") from e
+
+        return (result_markdown, figure_images)
