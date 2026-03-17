@@ -19,7 +19,18 @@ except ImportError:
     _MTMDChatHandler = None  # Older versions don't have this
 import folder_paths
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
-from typing import Dict, Any, List, Type
+from typing import Dict, Any, List, Type, Optional
+
+try:
+    from huggingface_hub import hf_hub_download
+except ImportError:
+    pass
+
+# Register layout YOLO models directory
+layout_yolo_dir = os.path.join(folder_paths.models_dir, "doclayout_yolo")
+if not os.path.exists(layout_yolo_dir):
+    os.makedirs(layout_yolo_dir, exist_ok=True)
+folder_paths.add_model_folder_path("doclayout_yolo", layout_yolo_dir)
 
 # Config file path
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
@@ -809,367 +820,333 @@ class FireRedOCREngine(ComfyNodeABC):
         return (markdown_text,)
 
 
-# ---------------------------------------------------------------------------
-# Prompt for the figure-detection VLM call
-# ---------------------------------------------------------------------------
-_FIGURE_DETECT_PROMPT = """\
-Look at this document image. Find all embedded photographs \
-(real photographic images, NOT bar/line charts, NOT decorative borders, NOT text blocks).
-Number them in reading order (top-to-bottom, left-to-right).
-For each photograph:
-- The bounding box must tightly surround ONLY the visual photo pixels.
-- Do NOT include any caption text, figure number, or surrounding whitespace in the bounding box.
-- Use pixel-accurate coordinates expressed as fractions of the FULL image dimensions.
-Return a JSON array. Each element must have:
-  "index": 1-based integer
-  "description": one-sentence caption of the photo content
-  "x": left  edge of photo as fraction of image width  (0.0–1.0)
-  "y": top   edge of photo as fraction of image height (0.0–1.0)
-  "w": width  of photo as fraction of image width      (0.0–1.0)
-  "h": height of photo as fraction of image height     (0.0–1.0)
-If no photographs are found, return: []
-Return ONLY the raw JSON array. No markdown fences, no explanation."""
 
 
-def _strip_thinking_and_parse_json(raw: str) -> list:
-    """Strip <think>...</think> (and orphan </think>) then parse JSON.
+class DocLayoutYOLOLoader(ComfyNodeABC):
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        # Get list of .pt files in doclayout_yolo folder
+        model_list = folder_paths.get_filename_list("doclayout_yolo")
+        model_list = [f for f in model_list if f.endswith('.pt')]
 
-    Handles the case where Qwen-VL / FireRed-OCR prefixes the answer with a
-    (possibly empty) reasoning block before the actual JSON payload.
-    """
-    import json, re
+        return {
+            "required": {
+                "model_name": (
+                    model_list + ["juliozhao/DocLayout-YOLO-DocStructBench (auto-download)"],
+                    {"tooltip": "Select a YOLOv10 .pt model from models/doclayout_yolo or auto-download the default one."}
+                )
+            }
+        }
 
-    # Remove complete <think>...</think> blocks
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
-    # Remove orphan </think> (model skipped the opening tag)
-    raw = re.sub(r".*?</think>", "", raw, flags=re.DOTALL)
-    # Strip markdown code fences
-    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
-    raw = re.sub(r"\n?```$", "", raw)
-    raw = raw.strip()
+    RETURN_TYPES = ("YOLO_MODEL",)
+    RETURN_NAMES = ("yolo_model",)
+    FUNCTION = "load_yolo"
+    CATEGORY = "LlamaCPP"
 
-    if not raw:
-        return []
+    def load_yolo(self, model_name: str) -> tuple:
+        try:
+            from doclayout_yolo import YOLOv10
+        except ImportError:
+            raise ImportError("Please install doclayout-yolo: pip install doclayout-yolo")
 
-    parsed = json.loads(raw)
+        if model_name == "juliozhao/DocLayout-YOLO-DocStructBench (auto-download)":
+            try:
+                import huggingface_hub
+            except ImportError:
+                raise ImportError("Please install huggingface_hub to use the auto-download feature: pip install huggingface_hub")
+                
+            repo_id = "juliozhao/DocLayout-YOLO-DocStructBench"
+            filename = "doclayout_yolo_docstructbench_imgsz1024.pt"
+            local_dir = folder_paths.get_folder_paths("doclayout_yolo")[0]
+            print(f"[DocLayout-YOLO] Downloading {filename} from {repo_id} to {local_dir}...")
+            # Download directly to the comfyui models folder
+            model_path = huggingface_hub.hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=local_dir,
+                local_dir_use_symlinks=False
+            )
+        else:
+            model_path = folder_paths.get_full_path("doclayout_yolo", model_name)
+            if not model_path:
+                raise FileNotFoundError(f"Model not found: {model_name}")
 
-    # Unwrap common dict wrappers e.g. {"figures": [...]}
-    if isinstance(parsed, dict):
-        for key in ("regions", "figures", "images", "items", "results"):
-            if key in parsed and isinstance(parsed[key], list):
-                return parsed[key]
-        # Fall back to first list value
-        for v in parsed.values():
-            if isinstance(v, list):
-                return v
-        return []
-
-    return parsed if isinstance(parsed, list) else []
-
-
-def _refine_photo_bbox(
-    src: torch.Tensor,
-    x1: int, y1: int, x2: int, y2: int,
-    expand: float = 0.15,
-    low_var_pct: float = 25.0,
-) -> tuple[int, int, int, int]:
-    """Tighten a coarse VLM bounding box to the actual photo pixels.
-
-    Photos have high colour variance per row/column; blank page margins and
-    caption text rows have very low variance (mostly white or uniform colour).
-
-    Parameters
-    ----------
-    src        : (H, W, C) float32 tensor for the full page.
-    x1,y1,x2,y2 : coarse pixel bbox from VLM.
-    expand     : fraction to expand the search window before scanning inward.
-    low_var_pct: rows/cols whose variance is below this percentile of the search
-                 window are considered non-photo and are trimmed.
-    """
-    import numpy as np
-
-    H, W, _ = src.shape
-    ph, pw = y2 - y1, x2 - x1
-
-    # Expand search window
-    ey, ex = int(ph * expand), int(pw * expand)
-    sy1 = max(0, y1 - ey)
-    sy2 = min(H, y2 + ey)
-    sx1 = max(0, x1 - ex)
-    sx2 = min(W, x2 + ex)
-
-    region = src[sy1:sy2, sx1:sx2, :].numpy()  # (rH, rW, C)
-
-    # Row-wise variance (mean over width and channels)
-    row_var = region.var(axis=(1, 2))          # (rH,)
-    col_var = region.var(axis=(0, 2))          # (rW,)
-
-    row_thresh = np.percentile(row_var, low_var_pct)
-    col_thresh = np.percentile(col_var, low_var_pct)
-
-    photo_rows = np.where(row_var > row_thresh)[0]
-    photo_cols = np.where(col_var > col_thresh)[0]
-
-    if len(photo_rows) == 0 or len(photo_cols) == 0:
-        return x1, y1, x2, y2  # fallback: return original
-
-    ry1 = sy1 + int(photo_rows[0])
-    ry2 = sy1 + int(photo_rows[-1]) + 1
-    rx1 = sx1 + int(photo_cols[0])
-    rx2 = sx1 + int(photo_cols[-1]) + 1
-
-    return rx1, ry1, rx2, ry2
+        print(f"[DocLayout-YOLO] Loading model from {model_path}...")
+        model = YOLOv10(model_path)
+        return (model,)
 
 
-class MarkdownFigureEmbedder(ComfyNodeABC):
-    """Detect embedded photos in a document image via VLM and embed them into
-    the OCR markdown output as base64 data-URIs.
-
-    Works in two modes:
-    - **With placeholders**: if the OCR markdown contains ``![FIGURE_1]``,
-      ``![FIGURE_2]`` … the corresponding crops are inserted in-place.
-    - **Without placeholders** (normal FireRed-OCR output): figures are
-      appended at the end of the markdown under a ``---`` separator.
-    """
-
+class DocLayoutMarkdownEngine(ComfyNodeABC):
     @classmethod
     def INPUT_TYPES(cls) -> InputTypeDict:
         return {
             "required": {
-                "model": ("LLAMA_MODEL", {"tooltip": "Vision-capable model with mmproj (same as OCR)"}),
-                "image": ("IMAGE", {"tooltip": "Source document image (same page sent to OCR)"}),
-                "markdown": (
-                    "STRING",
-                    {
-                        "multiline": True,
-                        "default": "",
-                        "tooltip": "Markdown from FireRedOCREngine",
-                    },
-                ),
+                "image": ("IMAGE", {"tooltip": "Document page image (single image or batch)."}),
+                "yolo_model": ("YOLO_MODEL", {"tooltip": "Loaded DocLayout-YOLO model."}),
+                "llm_model": ("LLAMA_MODEL", {"tooltip": "Loaded Llama VLM model for OCR (e.g., Qwen2.5-VL)."}),
             },
             "optional": {
-                "options": ("LLAMA_OPTIONS", {"tooltip": "Model options"}),
-                "memory_cleanup": (
-                    ["close", "backend_free", "full_cleanup", "persistent"],
-                    {"default": "close"},
-                ),
-                "padding": ("INT", {"default": 0, "min": -512, "max": 512,
-                                    "tooltip": "Pixels to add (positive) or remove (negative) around each crop"}),
-                "image_format": (["png", "jpeg"], {"default": "jpeg",
-                                                   "tooltip": "JPEG is smaller; PNG is lossless"}),
-                "jpeg_quality": ("INT", {"default": 85, "min": 1, "max": 100}),
-                "batch_index": ("INT", {"default": 0, "min": 0,
-                                        "tooltip": "Page index in image batch (0-indexed)"}),
-                "temperature": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01,
-                                          "tooltip": "Detection temperature (0.0 = fully deterministic)"}),
+                "options": ("LLAMA_OPTIONS", {"tooltip": "Model options from Llama CPP Options node"}),
+                "max_tokens": ("INT", {"default": 2048, "min": 128, "max": 65536, "tooltip": "Max tokens per OCR generation"}),
+                "temperature": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "memory_cleanup": (["close", "backend_free", "full_cleanup", "persistent"], {"default": "persistent"}),
                 "seed": ("INT", {"default": -1, "min": -1}),
-            },
+                "yolo_conf": ("FLOAT", {"default": 0.2, "min": 0.05, "max": 1.0, "step": 0.05, "tooltip": "YOLO confidence threshold"}),
+                "yolo_imgsz": ("INT", {"default": 1024, "min": 512, "max": 4096, "step": 32, "tooltip": "YOLO inference image size"}),
+                "enable_thinking": (IO.BOOLEAN, {"default": False, "tooltip": "Enable reasoning <think> (useful for some models)"}),
+                "text_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Extract the text in this image exactly as written. Do not add explanations. Keep formatting where possible.",
+                    "tooltip": "Prompt used for extracting Plain Text, Titles, and Captions."
+                }),
+                "formula_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Convert this mathematical formula to LaTeX. Output ONLY the latex code mathematically formatted inside $$ blocks. Do not add markdown backticks.",
+                    "tooltip": "Prompt used for parsing mathematical formulas."
+                }),
+                "table_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Convert this table to Markdown format. Output ONLY the table structure without any surrounding text.",
+                    "tooltip": "Prompt used for extracting Tables."
+                }),
+            }
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE")
-    RETURN_NAMES = ("markdown", "figure_images")
-    FUNCTION = "embed"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("markdown",)
+    FUNCTION = "process_layout"
     CATEGORY = "LlamaCPP"
 
-    @staticmethod
-    def _tensor_to_b64(crop: torch.Tensor, fmt: str, quality: int) -> str:
-        from torchvision.transforms.functional import to_pil_image
-        pil = to_pil_image(crop[0].permute(2, 0, 1))
-        buf = io.BytesIO()
-        if fmt == "jpeg":
-            pil = pil.convert("RGB")
-            pil.save(buf, format="JPEG", quality=quality)
-            mime = "image/jpeg"
-        else:
-            pil.save(buf, format="PNG")
-            mime = "image/png"
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        buf.close()
-        return f"data:{mime};base64,{b64}"
-
-    def embed(
+    def process_layout(
         self,
-        model: Dict[str, Any],
         image: torch.Tensor,
-        markdown: str,
-        options: Dict[str, Any] = None,
-        memory_cleanup: str = "close",
-        padding: int = 4,
-        image_format: str = "jpeg",
-        jpeg_quality: int = 85,
-        batch_index: int = 0,
-        temperature: float = 0.0,
+        yolo_model: Any,
+        llm_model: Dict[str, Any],
+        options: Optional[Dict[str, Any]] = None,
+        max_tokens: int = 2048,
+        temperature: float = 0.1,
+        memory_cleanup: str = "persistent",
         seed: int = -1,
+        yolo_conf: float = 0.2,
+        yolo_imgsz: int = 1024,
+        enable_thinking: bool = False,
+        text_prompt: str = "Extract the text in this image exactly as written. Do not add explanations. Keep formatting where possible.",
+        formula_prompt: str = "Convert this mathematical formula to LaTeX. Output ONLY the latex code mathematically formatted inside $$ blocks. Do not add markdown backticks.",
+        table_prompt: str = "Convert this table to Markdown format. Output ONLY the table structure without any surrounding text.",
     ) -> tuple:
-        import re
+        import cv2
+        import numpy as np
+
+        # Validate inputs
+        if not hasattr(yolo_model, "predict"):
+            raise ValueError("yolo_model does not appear to be a valid YOLO object.")
+        if not isinstance(llm_model, dict) or "model_path" not in llm_model:
+            raise ValueError("Invalid llm_model data.")
+        if "mmproj_model_path" not in llm_model:
+            raise ValueError("LLM must be a vision model with mmproj loaded.")
+            
+        chat_format = llm_model.get("chat_format", "")
+        if not chat_format.startswith("vision-"):
+            raise ValueError("Select a 'vision-*' format in the Model Loader.")
+
+        options = options or {}
+        
+        # --- LLM Engine Setup (extracted from LlamaCPPEngine) ---
         global _global_llm
+        llama_kwargs = {"model_path": llm_model["model_path"]}
+        for k, v in options.items():
+            if not k.startswith("vision_"):
+                llama_kwargs[k] = v
 
-        try:
-            if not isinstance(model, dict) or "model_path" not in model:
-                raise ValueError("Invalid model — connect a Llama CPP Model Loader")
-            if "mmproj_model_path" not in model:
-                raise ValueError("MarkdownFigureEmbedder requires a vision model with mmproj")
+        if llama_kwargs.get("n_threads", -1) <= 0:
+            llama_kwargs["n_threads"] = max(1, os.cpu_count() or 4)
 
-            chat_format = model.get("chat_format", "")
-            if not chat_format.startswith("vision-"):
-                raise ValueError(
-                    f"chat_format '{chat_format}' is not a vision handler. "
-                    "Select a 'vision-*' format in the Model Loader."
-                )
+        handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
+        handler_params = _get_handler_params(handler_class)
+        handler_kwargs = {
+            "clip_model_path": llm_model["mmproj_model_path"],
+            "verbose": options.get("verbose", False),
+        }
+        for k, v in options.items():
+            if k.startswith("vision_"):
+                param_name = k.replace("vision_", "")
+                if param_name in handler_params:
+                    handler_kwargs[param_name] = v
 
-            options = options or {}
-            model_path = model["model_path"]
+        chat_handler = handler_class(**handler_kwargs)
+        if hasattr(chat_handler, "extra_template_arguments"):
+            chat_handler.extra_template_arguments["enable_thinking"] = enable_thinking
+        llama_kwargs["chat_handler"] = chat_handler
 
-            # Check for FIGURE_N placeholders (FireRed-OCR typically won't emit them)
-            import re as _re
-            placeholder_indices = [int(m) for m in _re.findall(r"!\[FIGURE_(\d+)\]", markdown)]
-            has_placeholders = bool(placeholder_indices)
-            print(
-                f"[MarkdownFigureEmbedder] {'Found ' + str(len(placeholder_indices)) + ' FIGURE_N placeholder(s).' if has_placeholders else 'No placeholders — figures will be appended.'}"
-            )
-
-            # Build Llama kwargs
-            llama_kwargs = {"model_path": model_path}
-            for k, v in options.items():
-                if not k.startswith("vision_"):
-                    llama_kwargs[k] = v
-
-            if llama_kwargs.get("n_threads", -1) <= 0:
-                llama_kwargs["n_threads"] = max(1, os.cpu_count() or 4)
-
-            handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
-            handler_params = _get_handler_params(handler_class)
-            handler_kwargs = {
-                "clip_model_path": model["mmproj_model_path"],
-                "verbose": options.get("verbose", False),
-            }
-            for k, v in options.items():
-                if k.startswith("vision_"):
-                    pname = k.replace("vision_", "")
-                    if pname in handler_params:
-                        handler_kwargs[pname] = v
-
-            chat_handler = handler_class(**handler_kwargs)
-            llama_kwargs["chat_handler"] = chat_handler
-
-            current_identity = _model_identity(model, llama_kwargs)
-            if memory_cleanup == "persistent":
-                global _global_llm_identity
-                if _global_llm is None or _global_llm_identity != current_identity:
-                    _cleanup_global_llm("close")
-                    _global_llm = Llama(**llama_kwargs)
-                    _global_llm_identity = current_identity
-            else:
-                _cleanup_global_llm(memory_cleanup)
+        current_identity = _model_identity(llm_model, llama_kwargs)
+        if memory_cleanup == "persistent":
+            global _global_llm_identity
+            if _global_llm is None or _global_llm_identity != current_identity:
+                _cleanup_global_llm("close")
                 _global_llm = Llama(**llama_kwargs)
+                _global_llm_identity = current_identity
+        else:
+            _cleanup_global_llm(memory_cleanup)
+            _global_llm = Llama(**llama_kwargs)
 
-            # VLM detection call
-            idx = min(batch_index, image.shape[0] - 1)
-            page_tensor = image[idx].unsqueeze(0)
-            detect_messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": _convert_image_to_data_uri(page_tensor, 0)},
-                        {"type": "text", "text": _FIGURE_DETECT_PROMPT},
-                    ],
-                },
-                # Prefill an empty <think> block so the model skips reasoning
-                # and outputs JSON directly (same trick used in LlamaCPPEngine).
-                {"role": "assistant", "content": "<think>\n\n</think>\n\n"},
-            ]
-            print("[MarkdownFigureEmbedder] Running figure detection VLM call...")
-            det_response = _global_llm.create_chat_completion(
-                messages=detect_messages,
-                max_tokens=1024,
+        # Helper function for LLM inference
+        def _run_vlm(crop_tensor: torch.Tensor, prompt: str) -> str:
+            messages = list()
+            messages.append({"role": "user", "content": [
+                {"type": "image_url", "image_url": _convert_image_to_data_uri(crop_tensor, 0)},
+                {"type": "text", "text": prompt}
+            ]})
+            completion_messages = list(messages)
+            if not enable_thinking:
+                completion_messages.append({
+                    "role": "assistant",
+                    "content": "<think>\n\n</think>\n\n"
+                })
+            response = _global_llm.create_chat_completion(
+                messages=completion_messages,
+                max_tokens=max_tokens,
                 temperature=temperature,
                 seed=seed,
             )
-            raw_json = det_response["choices"][0]["message"]["content"] or ""
-            print(f"[MarkdownFigureEmbedder] Raw VLM response: {raw_json[:300]}")
+            text = response["choices"][0]["message"]["content"] or ""
+            # Strip fake think blocks if enable_thinking was false
+            if not enable_thinking:
+                import re
+                orphan_match = re.match(r"^(.*?)</think>\s*", text, re.DOTALL)
+                if orphan_match and "<think>" not in text[:orphan_match.end()]:
+                    text = text[orphan_match.end():]
+                text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+                text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
+                text = text.strip()
+            return text
 
-            # Parse: strip <think> blocks FIRST, then parse JSON
-            try:
-                regions = _strip_thinking_and_parse_json(raw_json)
-            except Exception as parse_err:
-                print(f"[MarkdownFigureEmbedder] JSON parse error: {parse_err}")
-                regions = []
+        # Function to process single page
+        def _process_page(page_tensor: torch.Tensor) -> str:
+            # 1. Image preparation for YOLO
+            # PyTorch Tensor (1, H, W, C) float32 -> Numpy (H, W, C) uint8
+            pil_img = ToPILImage()(page_tensor.squeeze(0).permute(2, 0, 1))
+            cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-            print(f"[MarkdownFigureEmbedder] Detected {len(regions)} figure(s).")
+            # 2. YOLO prediction
+            print("[DocLayoutMarkdown] Running YOLO Layout Prediction...")
+            det_res = yolo_model.predict(cv_img, imgsz=yolo_imgsz, conf=yolo_conf, device="cpu")[0]
+            
+            # Extract boxes
+            # doclayout-yolo assumes 0-indexed classes. Typical map: 
+            # 0: title, 1: plain text, 2: abandon, 3: figure, 4: figure caption, 
+            # 5: table, 6: table caption, 7: table footnote, 8: isolate_formula, 9: formula caption
+            names = det_res.names
 
-            if not regions:
-                print("[MarkdownFigureEmbedder] No figures detected — returning markdown unchanged.")
-                _cleanup_global_llm(memory_cleanup)
-                return (markdown, image)
+            boxes_data = []
+            for box in det_res.boxes:
+                x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].cpu().numpy())
+                cls_id = int(box.cls[0].cpu().numpy())
+                conf = float(box.conf[0].cpu().numpy())
+                label = names[cls_id]
 
-            # Crop regions
-            _, H, W, C = image.shape
-            src = image[idx]
-            figure_map: dict[int, tuple] = {}  # fig_idx → (crop, desc, data_uri)
-
-            for i, r in enumerate(regions):
-                try:
-                    fig_idx = int(r.get("index", i + 1))
-                    x1 = int(float(r["x"]) * W) - padding
-                    y1 = int(float(r["y"]) * H) - padding
-                    x2 = int((float(r["x"]) + float(r["w"])) * W) + padding
-                    y2 = int((float(r["y"]) + float(r["h"])) * H) + padding
-                except (KeyError, TypeError, ValueError) as exc:
-                    print(f"[MarkdownFigureEmbedder] Skipping region {i}: {exc}")
+                # We can group table elements, figure elements etc.
+                if label == "abandon":
                     continue
+                    
+                boxes_data.append({
+                    "bbox": (int(x1), int(max(0.0, float(y1)-5)), int(x2), int(float(y2)+5)),
+                    "label": label,
+                    "conf": conf,
+                    "center_y": (float(y1) + float(y2)) / 2,
+                    "center_x": (float(x1) + float(x2)) / 2
+                })
 
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(W, x2), min(H, y2)
-                if x2 <= x1 or y2 <= y1:
-                    print(f"[MarkdownFigureEmbedder] FIGURE_{fig_idx}: zero-size, skipping.")
-                    continue
-
-                crop = src[y1:y2, x1:x2, :].unsqueeze(0)
-                desc = r.get("description", f"Figure {fig_idx}")
-                data_uri = self._tensor_to_b64(crop, image_format, jpeg_quality)
-                figure_map[fig_idx] = (crop, desc, data_uri)
-                print(f"[MarkdownFigureEmbedder] FIGURE_{fig_idx}: '{desc}' → pixel [{x1},{y1},{x2},{y2}]")
-
-            if not figure_map:
-                print("[MarkdownFigureEmbedder] All regions invalid — returning markdown unchanged.")
-                _cleanup_global_llm(memory_cleanup)
-                return (markdown, image)
-
-            # Embed: replace placeholders or append
-            if has_placeholders:
-                def _repl(m: _re.Match) -> str:
-                    n = int(m.group(1))
-                    if n in figure_map:
-                        _, desc, data_uri = figure_map[n]
-                        return f"\n\n![{desc}]({data_uri})\n\n"
-                    return m.group(0)
-                result_markdown = _re.sub(r"!\[FIGURE_(\d+)\]", _repl, markdown)
-            else:
-                fig_section = "\n\n---\n\n"
-                for fidx in sorted(figure_map):
-                    _, desc, data_uri = figure_map[fidx]
-                    fig_section += f"![{desc}]({data_uri})\n\n*{desc}*\n\n"
-                result_markdown = markdown.rstrip() + fig_section
-
-            # Build IMAGE batch output
-            sorted_crops = [figure_map[k][0] for k in sorted(figure_map)]
-            max_h = max(c.shape[1] for c in sorted_crops)
-            max_w = max(c.shape[2] for c in sorted_crops)
-            padded_out = []
-            for c in sorted_crops:
-                ch, cw = c.shape[1], c.shape[2]
-                if ch == max_h and cw == max_w:
-                    padded_out.append(c)
+            # 3. Sort boxes in a reading order
+            # Basic sort: top-to-bottom, left-to-right (handles simple multi-column somewhat poorly, but ok for now)
+            # Group into text lines loosely by center_y
+            boxes_data.sort(key=lambda b: b["center_y"])
+            line_margin = 20
+            lines = []
+            current_line = []
+            
+            for b in boxes_data:
+                if not current_line:
+                    current_line.append(b)
                 else:
-                    canvas = torch.zeros(1, max_h, max_w, C, dtype=c.dtype)
-                    canvas[0, :ch, :cw] = c[0]
-                    padded_out.append(canvas)
-            figure_images = torch.cat(padded_out, dim=0)
+                    avg_y: float = sum(float(x["center_y"]) for x in current_line) / len(current_line)
+                    if abs(b["center_y"] - avg_y) < line_margin:
+                        current_line.append(b)
+                    else:
+                        lines.append(current_line)
+                        current_line = [b]
+            if current_line:
+                lines.append(current_line)
+                
+            sorted_boxes = []
+            for line in lines:
+                line.sort(key=lambda b: b["center_x"])
+                sorted_boxes.extend(line)
 
+            # 4. Process each region
+            md_elements = []
+            for i, region in enumerate(sorted_boxes):
+                x1, y1, x2, y2 = region["bbox"]
+                label = region["label"]
+                conf = region["conf"]
+                print(f"[DocLayoutMarkdown] Processing region {i+1}/{len(sorted_boxes)}: {label} ({conf:.2f})")
+
+                # Crop tensor
+                # Ensure bounds
+                h, w, _ = page_tensor.shape[1:4]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w-1, x2), min(h-1, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # Expand tensor back to B,H,W,C for VLM
+                crop_tensor = page_tensor[:, y1:y2, x1:x2, :]
+
+                if label in ["title", "plain text", "figure caption", "table caption", "table footnote", "formula caption"]:
+                    # Text Extraction
+                    text = _run_vlm(crop_tensor, text_prompt)
+                    if label == "title":
+                        md_elements.append(f"## {text.strip()}")
+                    elif label in ["figure caption", "table caption"]:
+                        md_elements.append(f"*{text.strip()}*")
+                    else:
+                        md_elements.append(text.strip())
+
+                elif label == "isolate_formula":
+                    # Formula Extraction
+                    latex = _run_vlm(crop_tensor, formula_prompt)
+                    # Automatically wrap in block equations if not already
+                    latex_text = latex.strip()
+                    if not latex_text.startswith("$$"):
+                        latex_text = f"$${latex_text}$$"
+                    md_elements.append(latex_text)
+
+                elif label == "table":
+                    # Table Extraction
+                    table_md = _run_vlm(crop_tensor, table_prompt)
+                    md_elements.append(table_md.strip())
+
+                elif label == "figure":
+                    # Image formatting directly to base64
+                    data_uri = _convert_image_to_data_uri(crop_tensor, 0)
+                    md_elements.append(f"![Figure]({data_uri})")
+
+            return "\n\n".join(md_elements)
+
+        # Iterate over batch
+        try:
+            page_results = []
+            batch_size = image.shape[0]
+            for i in range(batch_size):
+                page_tensor = image[i:i+1] # (1, H, W, C)
+                print(f"[DocLayoutMarkdown] ================= Page {i+1}/{batch_size} =================")
+                res = _process_page(page_tensor)
+                page_results.append(res)
+                
+            final_markdown = "\n\n---\n\n".join(page_results) if batch_size > 1 else page_results[0]
+            
             _cleanup_global_llm(memory_cleanup)
-
+            return (final_markdown,)
+            
         except Exception as e:
-            print(f"[MarkdownFigureEmbedder] Error: {e}")
-            raise RuntimeError(f"MarkdownFigureEmbedder Error: {e}") from e
-
-        return (result_markdown, figure_images)
+            print(f"DocLayoutMarkdown Engine Error: {str(e)}")
+            raise RuntimeError(f"DocLayoutMarkdown Engine Error: {str(e)}") from e

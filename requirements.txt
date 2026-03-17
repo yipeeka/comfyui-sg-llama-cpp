@@ -1,2 +1,5 @@
 llama-cpp-python
 pymupdf
+doclayout-yolo
+huggingface_hub
+opencv-python-headless

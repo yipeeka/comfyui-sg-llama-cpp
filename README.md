@@ -16,6 +16,7 @@ ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vi
 - Memory management options
 - **PDF Loader**: Convert PDF pages to ComfyUI IMAGE batches (requires `pymupdf`)
 - **FireRed-OCR**: Dedicated document OCR node (PDF/image → Markdown, with LaTeX & HTML table support)
+- **DocLayout-YOLO**: Integrated layout analysis for complex documents to group and sort elements by reading order.
 
 ## Installation
 
@@ -32,7 +33,7 @@ ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vi
 
 3. Install Python dependencies:
    ```bash
-   pip install pymupdf
+   pip install pymupdf doclayout-yolo huggingface_hub opencv-python-headless
    ```
 
 4. Restart ComfyUI.
@@ -191,6 +192,44 @@ Dedicated OCR node for **FireRed-OCR GGUF** models. Converts document/page image
 
 ---
 
+### DocLayoutYOLOLoader
+Loads the DocLayout-YOLO model for advanced document layout analysis.
+
+**Inputs**
+- **Required**:
+  - `model_name`: Select the `.pt` model file from `ComfyUI/models/doclayout_yolo/`. If you select the `(auto-download)` option, the node will automatically download the default model (`juliozhao/DocLayout-YOLO-DocStructBench`) from HuggingFace to the correct folder.
+
+**Outputs**
+- `yolo_model`: The loaded YOLOv10 Python object.
+
+---
+
+### DocLayoutMarkdownEngine
+Advanced structured OCR pipeline. Uses YOLO to identify page layout regions (titles, paragraphs, formulas, tables, figures), sorts them into reading order, and uses a Vision LLM (like FireRed-OCR or Qwen2.5-VL) to extract the text and formatting for each specific region.
+
+**Inputs**
+- **Required**:
+  - `image`: The document page image (or batch).
+  - `yolo_model`: Model from `DocLayoutYOLOLoader`.
+  - `llm_model`: Vision LLM from `LlamaCPPModelLoader` (requires `mmproj`).
+- **Optional**:
+  - `options`: Llama.cpp options.
+  - `text_prompt`: Custom prompt for extracting plain text and titles.
+  - `formula_prompt`: Custom prompt for LaTeX equation conversion.
+  - `table_prompt`: Custom prompt for Markdown table extraction.
+  - `yolo_conf`: YOLO detection confidence threshold (default: `0.2`).
+  - `yolo_imgsz`: Image scaling size for YOLO inference (default: `1024`).
+  - `enable_thinking`: Enable/disable `<think>` generation for the Vision model.
+  - `max_tokens`: Tokens allowed per region extraction.
+  - `temperature`: Sampling temperature.
+  - `memory_cleanup`: RAM/VRAM cleanup behavior.
+
+**Outputs**
+- `markdown`: The final stitched markdown document (ordered top-to-bottom).
+- `figure_images`: Extracted figure/photograph crops as a ComfyUI IMAGE batch.
+
+---
+
 ## Custom Model Folders
 
 By default, the node loads GGUF models from ComfyUI's `text_encoders` folder. You can optionally specify additional folders with a `config.json` file.
@@ -253,7 +292,8 @@ Download: [mradermacher/FireRed-OCR-GGUF](https://huggingface.co/mradermacher/Fi
 ## Requirements
 
 - llama-cpp-python ≥ v0.3.30 (from https://github.com/JamePeng/llama-cpp-python)
-- pymupdf (optional, for PDF support — `pip install pymupdf`)
+- pymupdf (optional, for PDF support)
+- doclayout-yolo, huggingface_hub, opencv-python-headless (optional, for Advanced Layout Analysis)
 
 ## License
 
