@@ -887,6 +887,24 @@ class DocLayoutMarkdownEngine(ComfyNodeABC):
             },
             "optional": {
                 "options": ("LLAMA_OPTIONS", {"tooltip": "Model options from Llama CPP Options node"}),
+                "processing_mode": (
+                    ["per_region", "full_page_ocr"],
+                    {
+                        "default": "per_region",
+                        "tooltip": (
+                            "per_region: LLM processes each YOLO-detected region individually. "
+                            "full_page_ocr: LLM receives the whole page image once (faster); "
+                            "YOLO only locates figures which are extracted and embedded as images."
+                        ),
+                    },
+                ),
+                "max_page_size": ("INT", {
+                    "default": 1024,
+                    "min": 256,
+                    "max": 4096,
+                    "step": 64,
+                    "tooltip": "[full_page_ocr] Longest edge (px) to which the full page is downscaled before sending to the LLM. Reduces image token count and prevents KV-cache overflow.",
+                }),
                 "max_tokens": ("INT", {"default": 2048, "min": 128, "max": 65536, "tooltip": "Max tokens per OCR generation"}),
                 "temperature": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "memory_cleanup": (["close", "backend_free", "full_cleanup", "persistent"], {"default": "persistent"}),
@@ -897,23 +915,28 @@ class DocLayoutMarkdownEngine(ComfyNodeABC):
                 "text_prompt": ("STRING", {
                     "multiline": True,
                     "default": "Extract the text in this image exactly as written. Do not add explanations. Keep formatting where possible.",
-                    "tooltip": "Prompt used for extracting Plain Text, Titles, and Captions."
+                    "tooltip": "[per_region] Prompt for Plain Text, Titles, and Captions."
                 }),
                 "formula_prompt": ("STRING", {
                     "multiline": True,
                     "default": "Convert this mathematical formula to LaTeX. Output ONLY the latex code mathematically formatted inside $$ blocks. Do not add markdown backticks.",
-                    "tooltip": "Prompt used for parsing mathematical formulas."
+                    "tooltip": "[per_region] Prompt for mathematical formulas."
                 }),
                 "table_prompt": ("STRING", {
                     "multiline": True,
                     "default": "Convert this table to Markdown format. Output ONLY the table structure without any surrounding text.",
-                    "tooltip": "Prompt used for extracting Tables."
+                    "tooltip": "[per_region] Prompt for tables."
+                }),
+                "page_ocr_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Convert this document page to Markdown. Preserve headings, paragraphs, lists, tables (as Markdown tables), and formulas (as LaTeX inside $$ blocks). Do not add any commentary.",
+                    "tooltip": "[full_page_ocr] Prompt sent with the whole page image to the LLM."
                 }),
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("markdown",)
+    RETURN_TYPES = ("STRING", "IMAGE")
+    RETURN_NAMES = ("markdown", "figure_images")
     FUNCTION = "process_layout"
     CATEGORY = "LlamaCPP"
 
@@ -923,6 +946,8 @@ class DocLayoutMarkdownEngine(ComfyNodeABC):
         yolo_model: Any,
         llm_model: Dict[str, Any],
         options: Optional[Dict[str, Any]] = None,
+        processing_mode: str = "per_region",
+        max_page_size: int = 1024,
         max_tokens: int = 2048,
         temperature: float = 0.1,
         memory_cleanup: str = "persistent",
@@ -933,6 +958,7 @@ class DocLayoutMarkdownEngine(ComfyNodeABC):
         text_prompt: str = "Extract the text in this image exactly as written. Do not add explanations. Keep formatting where possible.",
         formula_prompt: str = "Convert this mathematical formula to LaTeX. Output ONLY the latex code mathematically formatted inside $$ blocks. Do not add markdown backticks.",
         table_prompt: str = "Convert this table to Markdown format. Output ONLY the table structure without any surrounding text.",
+        page_ocr_prompt: str = "Convert this document page to Markdown. Preserve headings, paragraphs, lists, tables (as Markdown tables), and formulas (as LaTeX inside $$ blocks). Do not add any commentary.",
     ) -> tuple:
         import cv2
         import numpy as np
@@ -1021,7 +1047,7 @@ class DocLayoutMarkdownEngine(ComfyNodeABC):
             return text
 
         # Function to process single page
-        def _process_page(page_tensor: torch.Tensor) -> str:
+        def _process_page(page_tensor: torch.Tensor) -> tuple:
             # 1. Image preparation for YOLO
             # PyTorch Tensor (1, H, W, C) float32 -> Numpy (H, W, C) uint8
             pil_img = ToPILImage()(page_tensor.squeeze(0).permute(2, 0, 1))
@@ -1056,96 +1082,226 @@ class DocLayoutMarkdownEngine(ComfyNodeABC):
                     "center_x": (float(x1) + float(x2)) / 2
                 })
 
-            # 3. Sort boxes in a reading order
-            # Basic sort: top-to-bottom, left-to-right (handles simple multi-column somewhat poorly, but ok for now)
-            # Group into text lines loosely by center_y
-            boxes_data.sort(key=lambda b: b["center_y"])
-            line_margin = 20
-            lines = []
-            current_line = []
-            
-            for b in boxes_data:
-                if not current_line:
-                    current_line.append(b)
-                else:
-                    avg_y: float = sum(float(x["center_y"]) for x in current_line) / len(current_line)
-                    if abs(b["center_y"] - avg_y) < line_margin:
-                        current_line.append(b)
-                    else:
-                        lines.append(current_line)
-                        current_line = [b]
-            if current_line:
-                lines.append(current_line)
-                
-            sorted_boxes = []
-            for line in lines:
-                line.sort(key=lambda b: b["center_x"])
-                sorted_boxes.extend(line)
+            # 3. Sort boxes in reading order (column-aware)
+            # Strategy:
+            #   a) Separate "spanning" boxes (width > 60% of page) from "column" boxes.
+            #      Spanning boxes (full-width titles, bylines) would fill the coverage
+            #      histogram and prevent column gap detection.
+            #   b) Use only column boxes to find vertical gutters (zero-coverage runs).
+            #   c) Assign column boxes to detected columns; sort each column top→bottom.
+            #   d) Merge spans + column content in reading order by interleaving on y1.
+            if not boxes_data:
+                sorted_boxes = []
+            else:
+                img_w = cv_img.shape[1]
+                span_threshold = img_w * 0.6  # boxes wider than this are "spanning"
 
-            # 4. Process each region
+                spanning = []  # full-width elements (headers, bylines)
+                col_boxes = []  # proper column content
+                for b in boxes_data:
+                    bx1, _, bx2, _ = b["bbox"]
+                    if (bx2 - bx1) >= span_threshold:
+                        spanning.append(b)
+                    else:
+                        col_boxes.append(b)
+
+                # Build coverage histogram from narrow (column) boxes only
+                coverage = [0] * (img_w + 1)
+                for b in col_boxes:
+                    bx1, _, bx2, _ = b["bbox"]
+                    for px in range(max(0, bx1), min(img_w, bx2)):
+                        coverage[px] += 1
+
+                # Find column boundaries via zero-coverage gutters (≥ 1% page width)
+                min_gap = max(10, img_w // 100)
+                col_splits = [0]
+                in_gap = False
+                gap_start = 0
+                for px in range(img_w):
+                    if coverage[px] == 0:
+                        if not in_gap:
+                            in_gap = True
+                            gap_start = px
+                    else:
+                        if in_gap:
+                            gap_end = px
+                            if gap_end - gap_start >= min_gap:
+                                col_splits.append((gap_start + gap_end) // 2)
+                            in_gap = False
+                col_splits.append(img_w)
+
+                col_bounds = [(col_splits[i], col_splits[i + 1]) for i in range(len(col_splits) - 1)]
+                columns = [[] for _ in col_bounds]
+
+                # Assign each column box to the column containing its center_x
+                for b in col_boxes:
+                    cx = b["center_x"]
+                    assigned = False
+                    for ci, (cl, cr) in enumerate(col_bounds):
+                        if cl <= cx < cr:
+                            columns[ci].append(b)
+                            assigned = True
+                            break
+                    if not assigned:
+                        columns[-1].append(b)
+
+                # Sort each column top→bottom, then merge left→right
+                col_sorted = []
+                for col in columns:
+                    col.sort(key=lambda b: b["bbox"][1])
+                    col_sorted.extend(col)
+
+                # Sort spanning elements top→bottom
+                spanning.sort(key=lambda b: b["bbox"][1])
+
+                # Interleave spanning boxes back into col_sorted by y1.
+                # A spanning box is inserted before the first column box whose
+                # y1 is greater than the spanning box's y1.
+                sorted_boxes = []
+                span_iter = iter(spanning)
+                next_span = next(span_iter, None)
+                for cb in col_sorted:
+                    while next_span is not None and next_span["bbox"][1] <= cb["bbox"][1]:
+                        sorted_boxes.append(next_span)
+                        next_span = next(span_iter, None)
+                    sorted_boxes.append(cb)
+                # Append any remaining spanning boxes (e.g. footer-spanning elements)
+                if next_span is not None:
+                    sorted_boxes.append(next_span)
+                for s in span_iter:
+                    sorted_boxes.append(s)
+
+            # figure_idx is shared across pages via a mutable container so that
+            # figure numbers are globally unique within a batch.
+            # _process_page returns (markdown_str, [crop_tensor, ...])
+            def _embed_figure(crop_tensor: torch.Tensor, fig_index: int) -> str:
+                """Return a markdown image tag with base64 src and a Figure-N label."""
+                data_uri = _convert_image_to_data_uri(crop_tensor, 0)
+                return f"![Figure {fig_index}]({data_uri})"
+
+            figure_crops: list = []  # collected crop tensors for this page
+
+            _PAGE_OCR_SENTINEL = "__PAGE_OCR__"
             md_elements = []
+            page_ocr_inserted = False
+
             for i, region in enumerate(sorted_boxes):
                 x1, y1, x2, y2 = region["bbox"]
                 label = region["label"]
                 conf = region["conf"]
                 print(f"[DocLayoutMarkdown] Processing region {i+1}/{len(sorted_boxes)}: {label} ({conf:.2f})")
 
-                # Crop tensor
-                # Ensure bounds
                 h, w, _ = page_tensor.shape[1:4]
                 x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w-1, x2), min(h-1, y2)
+                x2, y2 = min(w - 1, x2), min(h - 1, y2)
                 if x2 <= x1 or y2 <= y1:
                     continue
-                
-                # Expand tensor back to B,H,W,C for VLM
+
                 crop_tensor = page_tensor[:, y1:y2, x1:x2, :]
 
-                if label in ["title", "plain text", "figure caption", "table caption", "table footnote", "formula caption"]:
-                    # Text Extraction
-                    text = _run_vlm(crop_tensor, text_prompt)
-                    if label == "title":
-                        md_elements.append(f"## {text.strip()}")
-                    elif label in ["figure caption", "table caption"]:
-                        md_elements.append(f"*{text.strip()}*")
+                if processing_mode == "full_page_ocr":
+                    if label == "figure":
+                        figure_crops.append(crop_tensor)
+                        fig_num = page_figure_offset + len(figure_crops)
+                        md_elements.append(_embed_figure(crop_tensor, fig_num))
                     else:
-                        md_elements.append(text.strip())
+                        if not page_ocr_inserted:
+                            md_elements.append(_PAGE_OCR_SENTINEL)
+                            page_ocr_inserted = True
+                else:
+                    if label in ["title", "plain text", "figure caption", "table caption", "table footnote", "formula caption"]:
+                        text = _run_vlm(crop_tensor, text_prompt)
+                        if label == "title":
+                            md_elements.append(f"## {text.strip()}")
+                        elif label in ["figure caption", "table caption"]:
+                            md_elements.append(f"*{text.strip()}*")
+                        else:
+                            md_elements.append(text.strip())
 
-                elif label == "isolate_formula":
-                    # Formula Extraction
-                    latex = _run_vlm(crop_tensor, formula_prompt)
-                    # Automatically wrap in block equations if not already
-                    latex_text = latex.strip()
-                    if not latex_text.startswith("$$"):
-                        latex_text = f"$${latex_text}$$"
-                    md_elements.append(latex_text)
+                    elif label == "isolate_formula":
+                        latex = _run_vlm(crop_tensor, formula_prompt)
+                        latex_text = latex.strip()
+                        if not latex_text.startswith("$$"):
+                            latex_text = f"$${latex_text}$$"
+                        md_elements.append(latex_text)
 
-                elif label == "table":
-                    # Table Extraction
-                    table_md = _run_vlm(crop_tensor, table_prompt)
-                    md_elements.append(table_md.strip())
+                    elif label == "table":
+                        table_md = _run_vlm(crop_tensor, table_prompt)
+                        md_elements.append(table_md.strip())
 
-                elif label == "figure":
-                    # Image formatting directly to base64
-                    data_uri = _convert_image_to_data_uri(crop_tensor, 0)
-                    md_elements.append(f"![Figure]({data_uri})")
+                    elif label == "figure":
+                        figure_crops.append(crop_tensor)
+                        fig_num = page_figure_offset + len(figure_crops)
+                        md_elements.append(_embed_figure(crop_tensor, fig_num))
 
-            return "\n\n".join(md_elements)
+            if processing_mode == "full_page_ocr" and page_ocr_inserted:
+                print("[DocLayoutMarkdown] full_page_ocr: running single full-page LLM call...")
+                # Reset KV cache so leftover state from any prior per-region calls
+                # (or previous pages) doesn't block allocation for the full-page image.
+                if hasattr(_global_llm, "reset"):
+                    _global_llm.reset()
+
+                # Downscale the page image if it's larger than max_page_size on its
+                # longest edge — this is the primary cause of the KV-cache OOM.
+                ocr_tensor = page_tensor  # (1, H, W, C)
+                ph, pw = int(page_tensor.shape[1]), int(page_tensor.shape[2])
+                longest = max(ph, pw)
+                if longest > max_page_size:
+                    scale = max_page_size / longest
+                    new_h, new_w = max(1, int(ph * scale)), max(1, int(pw * scale))
+                    # torch.nn.functional.interpolate expects (N, C, H, W)
+                    import torch.nn.functional as F
+                    ocr_tensor = F.interpolate(
+                        page_tensor.permute(0, 3, 1, 2).float(),
+                        size=(new_h, new_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).permute(0, 2, 3, 1)
+                    print(f"[DocLayoutMarkdown] full_page_ocr: scaled page {ph}x{pw} → {new_h}x{new_w}")
+
+                page_text = _run_vlm(ocr_tensor, page_ocr_prompt)
+                md_elements = [
+                    page_text.strip() if el == _PAGE_OCR_SENTINEL else el
+                    for el in md_elements
+                ]
+
+            return "\n\n".join(md_elements), figure_crops
 
         # Iterate over batch
         try:
             page_results = []
+            all_figure_crops: list = []  # flat list of (1,H,W,C) tensors across all pages
             batch_size = image.shape[0]
             for i in range(batch_size):
-                page_tensor = image[i:i+1] # (1, H, W, C)
+                page_tensor = image[i:i+1]  # (1, H, W, C)
                 print(f"[DocLayoutMarkdown] ================= Page {i+1}/{batch_size} =================")
-                res = _process_page(page_tensor)
-                page_results.append(res)
-                
+                page_figure_offset = len(all_figure_crops)  # figure index offset for this page
+                md_text, page_figures = _process_page(page_tensor)
+                page_results.append(md_text)
+                all_figure_crops.extend(page_figures)
+
             final_markdown = "\n\n---\n\n".join(page_results) if batch_size > 1 else page_results[0]
-            
+
+            # Build figure_images tensor — pad all crops to the same H×W
+            if all_figure_crops:
+                max_h = max(int(t.shape[1]) for t in all_figure_crops)
+                max_w = max(int(t.shape[2]) for t in all_figure_crops)
+                padded = []
+                for t in all_figure_crops:  # t is (1, h, w, C)
+                    h, w = int(t.shape[1]), int(t.shape[2])
+                    if h < max_h or w < max_w:
+                        canvas = torch.zeros(1, max_h, max_w, t.shape[3], dtype=t.dtype, device=t.device)
+                        canvas[:, :h, :w, :] = t
+                        padded.append(canvas)
+                    else:
+                        padded.append(t)
+                figure_images = torch.cat(padded, dim=0)  # (N, H, W, C)
+            else:
+                # No figures detected — return a 1×1 transparent placeholder
+                figure_images = torch.zeros(1, 1, 1, 3, dtype=torch.float32)
+
             _cleanup_global_llm(memory_cleanup)
-            return (final_markdown,)
+            return (final_markdown, figure_images)
             
         except Exception as e:
             print(f"DocLayoutMarkdown Engine Error: {str(e)}")
