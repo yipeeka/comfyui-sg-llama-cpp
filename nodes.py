@@ -104,6 +104,78 @@ def _convert_image_to_data_uri(image_tensor: torch.Tensor, batch_index: int = 0)
         raise ValueError(f"Failed to convert image tensor to data URI: {str(e)}")
 
 
+def _convert_image_to_pil(image_tensor: torch.Tensor, batch_index: int = 0) -> Image.Image:
+    """Convert a ComfyUI image tensor to a PIL image."""
+    try:
+        to_pil = ToPILImage()
+        idx = min(batch_index, image_tensor.shape[0] - 1)
+        return to_pil(image_tensor[idx].permute(2, 0, 1))
+    except Exception as e:
+        raise ValueError(f"Failed to convert image tensor to PIL image: {str(e)}")
+
+
+def _convert_pil_to_data_uri(pil_img: Image.Image) -> str:
+    """Convert a PIL image to a base64 data URI."""
+    try:
+        buffered = io.BytesIO()
+        pil_img.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+        buffered.close()
+        return f"data:image/png;base64,{img_base64}"
+    except Exception as e:
+        raise ValueError(f"Failed to convert PIL image to data URI: {str(e)}")
+
+
+def _convert_pil_to_tensor(pil_img: Image.Image) -> torch.Tensor:
+    """Convert a PIL image to ComfyUI IMAGE tensor shape (1, H, W, C)."""
+    try:
+        import numpy as np
+
+        arr = np.array(pil_img.convert("RGB"), dtype=np.float32) / 255.0
+        return torch.from_numpy(arr).unsqueeze(0)
+    except Exception as e:
+        raise ValueError(f"Failed to convert PIL image to tensor: {str(e)}")
+
+
+def _image_batch_to_docling_stream(image_tensor: torch.Tensor, name: str = "document.tiff"):
+    """Convert a ComfyUI IMAGE batch to a multi-page TIFF DocumentStream for Docling."""
+    try:
+        from io import BytesIO
+        from docling.datamodel.base_models import DocumentStream
+    except ImportError as e:
+        raise ImportError("docling is required. Install with: pip install docling") from e
+
+    pil_pages = [_convert_image_to_pil(image_tensor, i).convert("RGB") for i in range(int(image_tensor.shape[0]))]
+    if not pil_pages:
+        raise ValueError("image batch is empty")
+
+    buf = BytesIO()
+    first, rest = pil_pages[0], pil_pages[1:]
+    first.save(
+        buf,
+        format="TIFF",
+        save_all=True,
+        append_images=rest,
+        compression="tiff_deflate",
+    )
+    buf.seek(0)
+    return DocumentStream(name=name, stream=buf)
+
+
+def _split_paged_output(text: str) -> List[str]:
+    """Split <!-- Page N --> joined output back into page-sized chunks."""
+    import re
+
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    pattern = r"(?:^|\n)\s*<!--\s*Page\s+\d+\s*-->\s*\n?"
+    parts = re.split(pattern, text)
+    parts = [part.strip() for part in parts if part.strip()]
+    return parts if parts else [text]
+
+
 def _get_handler_params(handler_class: type) -> set:
     """Walk the full MRO to collect all explicitly-named __init__ params."""
     params = set()
@@ -818,6 +890,360 @@ class FireRedOCREngine(ComfyNodeABC):
             raise RuntimeError(f"FireRed-OCR Error: {str(e)}") from e
 
         return (markdown_text,)
+
+
+class DoclingLayoutAnalyzer(ComfyNodeABC):
+    """Analyze document layout with Docling and emit a JSON summary."""
+
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Document page image batch. PDFLoader output works well here."}),
+            },
+            "optional": {
+                "document_name": ("STRING", {"default": "document", "tooltip": "Logical document name for Docling conversion."}),
+                "do_ocr": (IO.BOOLEAN, {"default": False, "tooltip": "Enable Docling OCR inside layout analysis.", "label_on": "Enabled", "label_off": "Disabled"}),
+                "do_table_structure": (IO.BOOLEAN, {"default": True, "tooltip": "Enable Docling table-structure analysis.", "label_on": "Enabled", "label_off": "Disabled"}),
+                "images_scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.1, "tooltip": "Image scale used by Docling page rendering."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("layout_json",)
+    FUNCTION = "analyze"
+    CATEGORY = "LlamaCPP"
+
+    def analyze(
+        self,
+        image: torch.Tensor,
+        document_name: str = "document",
+        do_ocr: bool = False,
+        do_table_structure: bool = True,
+        images_scale: float = 2.0,
+    ) -> tuple:
+        try:
+            try:
+                from docling.document_converter import DocumentConverter, ImageFormatOption
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import PdfPipelineOptions
+            except ImportError as e:
+                raise ImportError("docling is required. Install with: pip install docling") from e
+
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_ocr = do_ocr
+            pipeline_options.do_table_structure = do_table_structure
+            pipeline_options.generate_page_images = True
+            pipeline_options.images_scale = images_scale
+
+            converter = DocumentConverter(
+                allowed_formats=[InputFormat.IMAGE],
+                format_options={
+                    InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline_options),
+                },
+            )
+
+            stream = _image_batch_to_docling_stream(image, name=f"{document_name or 'document'}.tiff")
+            result = converter.convert(stream)
+            doc = result.document
+
+            layout = []
+            for item, _level in doc.iterate_items():
+                prov = item.prov[0] if getattr(item, "prov", None) else None
+                bbox = getattr(prov, "bbox", None)
+                layout.append({
+                    "type": type(item).__name__,
+                    "label": str(getattr(item, "label", "")),
+                    "page_no": getattr(prov, "page_no", None),
+                    "text_preview": (getattr(item, "text", "") or "")[:200],
+                    "bbox": {
+                        "l": getattr(bbox, "l", None),
+                        "t": getattr(bbox, "t", None),
+                        "r": getattr(bbox, "r", None),
+                        "b": getattr(bbox, "b", None),
+                    } if bbox is not None else None,
+                })
+
+            payload = {
+                "document_name": document_name,
+                "page_count": len(getattr(doc, "pages", []) or []),
+                "items": layout,
+            }
+            return (json.dumps(payload, indent=2, ensure_ascii=False),)
+
+        except Exception as e:
+            print(f"[DoclingLayoutAnalyzer] Error: {str(e)}")
+            raise RuntimeError(f"Docling Layout Analyzer Error: {str(e)}") from e
+
+
+class DoclingLayoutMarkdownEngine(ComfyNodeABC):
+    """Hybrid Markdown engine: Docling for layout, external VLM for recognition."""
+
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Document page image batch."}),
+                "llm_model": ("LLAMA_MODEL", {"tooltip": "Loaded vision LLM model for OCR/recognition."}),
+            },
+            "optional": {
+                "options": ("LLAMA_OPTIONS", {"tooltip": "Model options from Llama CPP Options node"}),
+                "document_name": ("STRING", {"default": "document", "tooltip": "Logical document name for Docling conversion."}),
+                "do_ocr": (IO.BOOLEAN, {"default": False, "tooltip": "Enable Docling OCR during layout analysis.", "label_on": "Enabled", "label_off": "Disabled"}),
+                "do_table_structure": (IO.BOOLEAN, {"default": True, "tooltip": "Enable Docling table-structure analysis.", "label_on": "Enabled", "label_off": "Disabled"}),
+                "images_scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.1, "tooltip": "Image scale used by Docling page rendering."}),
+                "max_tokens": ("INT", {"default": 2048, "min": 128, "max": 65536, "tooltip": "Max tokens per region extraction"}),
+                "temperature": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "memory_cleanup": (["close", "backend_free", "full_cleanup", "persistent"], {"default": "persistent"}),
+                "seed": ("INT", {"default": -1, "min": -1}),
+                "enable_thinking": (IO.BOOLEAN, {"default": False, "tooltip": "Enable reasoning <think> for the vision model"}),
+                "text_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Extract the text in this image exactly as written. Do not add explanations. Keep formatting where possible.",
+                    "tooltip": "Prompt for text-like regions."
+                }),
+                "title_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Extract this heading/title exactly as written. Output only the title text.",
+                    "tooltip": "Prompt for titles and section headers."
+                }),
+                "formula_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Convert this mathematical formula to LaTeX. Output ONLY the latex code mathematically formatted inside $$ blocks. Do not add markdown backticks.",
+                    "tooltip": "Prompt for mathematical formulas."
+                }),
+                "table_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Convert this table to Markdown format. Output ONLY the table structure without any surrounding text.",
+                    "tooltip": "Prompt for table regions."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING")
+    RETURN_NAMES = ("markdown", "figure_images", "layout_json")
+    FUNCTION = "process_layout"
+    CATEGORY = "LlamaCPP"
+
+    def process_layout(
+        self,
+        image: torch.Tensor,
+        llm_model: Dict[str, Any],
+        options: Optional[Dict[str, Any]] = None,
+        document_name: str = "document",
+        do_ocr: bool = False,
+        do_table_structure: bool = True,
+        images_scale: float = 2.0,
+        max_tokens: int = 2048,
+        temperature: float = 0.1,
+        memory_cleanup: str = "persistent",
+        seed: int = -1,
+        enable_thinking: bool = False,
+        text_prompt: str = "Extract the text in this image exactly as written. Do not add explanations. Keep formatting where possible.",
+        title_prompt: str = "Extract this heading/title exactly as written. Output only the title text.",
+        formula_prompt: str = "Convert this mathematical formula to LaTeX. Output ONLY the latex code mathematically formatted inside $$ blocks. Do not add markdown backticks.",
+        table_prompt: str = "Convert this table to Markdown format. Output ONLY the table structure without any surrounding text.",
+    ) -> tuple:
+        try:
+            try:
+                from docling.document_converter import DocumentConverter, ImageFormatOption
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import PdfPipelineOptions
+            except ImportError as e:
+                raise ImportError("docling is required. Install with: pip install docling") from e
+
+            if not isinstance(llm_model, dict) or "model_path" not in llm_model:
+                raise ValueError("Invalid llm_model data.")
+            if "mmproj_model_path" not in llm_model:
+                raise ValueError("LLM must be a vision model with mmproj loaded.")
+
+            chat_format = llm_model.get("chat_format", "")
+            if not chat_format.startswith("vision-"):
+                raise ValueError("Select a 'vision-*' format in the Model Loader.")
+
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_ocr = do_ocr
+            pipeline_options.do_table_structure = do_table_structure
+            pipeline_options.generate_page_images = True
+            pipeline_options.images_scale = images_scale
+
+            converter = DocumentConverter(
+                allowed_formats=[InputFormat.IMAGE],
+                format_options={
+                    InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline_options),
+                },
+            )
+            stream = _image_batch_to_docling_stream(image, name=f"{document_name or 'document'}.tiff")
+            result = converter.convert(stream)
+            doc = result.document
+
+            options = options or {}
+            global _global_llm
+            llama_kwargs = {"model_path": llm_model["model_path"]}
+            for k, v in options.items():
+                if not k.startswith("vision_"):
+                    llama_kwargs[k] = v
+
+            if llama_kwargs.get("n_threads", -1) <= 0:
+                llama_kwargs["n_threads"] = max(1, os.cpu_count() or 4)
+
+            handler_class = VISION_HANDLERS.get(chat_format, Llava15ChatHandler)
+            handler_params = _get_handler_params(handler_class)
+            handler_kwargs = {
+                "clip_model_path": llm_model["mmproj_model_path"],
+                "verbose": options.get("verbose", False),
+            }
+            for k, v in options.items():
+                if k.startswith("vision_"):
+                    param_name = k.replace("vision_", "")
+                    if param_name in handler_params:
+                        handler_kwargs[param_name] = v
+
+            chat_handler = handler_class(**handler_kwargs)
+            if hasattr(chat_handler, "extra_template_arguments"):
+                chat_handler.extra_template_arguments["enable_thinking"] = enable_thinking
+            llama_kwargs["chat_handler"] = chat_handler
+
+            current_identity = _model_identity(llm_model, llama_kwargs)
+            if memory_cleanup == "persistent":
+                global _global_llm_identity
+                if _global_llm is None or _global_llm_identity != current_identity:
+                    _cleanup_global_llm("close")
+                    _global_llm = Llama(**llama_kwargs)
+                    _global_llm_identity = current_identity
+            else:
+                _cleanup_global_llm(memory_cleanup)
+                _global_llm = Llama(**llama_kwargs)
+
+            def _run_vlm_pil(pil_img: Image.Image, prompt: str) -> str:
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": _convert_pil_to_data_uri(pil_img)},
+                        {"type": "text", "text": prompt},
+                    ],
+                }]
+                completion_messages = list(messages)
+                if not enable_thinking:
+                    completion_messages.append({
+                        "role": "assistant",
+                        "content": "<think>\n\n</think>\n\n"
+                    })
+                response = _global_llm.create_chat_completion(
+                    messages=completion_messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    seed=seed,
+                )
+                text = response["choices"][0]["message"]["content"] or ""
+                if not enable_thinking:
+                    import re
+                    orphan_match = re.match(r"^(.*?)</think>\s*", text, re.DOTALL)
+                    if orphan_match and "<think>" not in text[:orphan_match.end()]:
+                        text = text[orphan_match.end():]
+                    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+                    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
+                    text = text.strip()
+                return text
+
+            page_elements = {}
+            layout_items = []
+            figure_crops = []
+
+            for item, _level in doc.iterate_items():
+                prov = item.prov[0] if getattr(item, "prov", None) else None
+                page_no = int(getattr(prov, "page_no", 1) or 1)
+                if page_no not in page_elements:
+                    page_elements[page_no] = []
+
+                bbox = getattr(prov, "bbox", None)
+                label_str = str(getattr(item, "label", "")).lower()
+                type_name = type(item).__name__
+
+                layout_items.append({
+                    "type": type_name,
+                    "label": str(getattr(item, "label", "")),
+                    "page_no": page_no,
+                    "text_preview": (getattr(item, "text", "") or "")[:200],
+                    "bbox": {
+                        "l": getattr(bbox, "l", None),
+                        "t": getattr(bbox, "t", None),
+                        "r": getattr(bbox, "r", None),
+                        "b": getattr(bbox, "b", None),
+                    } if bbox is not None else None,
+                })
+
+                try:
+                    crop = item.get_image(doc)
+                except Exception:
+                    crop = None
+
+                if crop is None:
+                    continue
+
+                type_name_lower = type_name.lower()
+                if "picture" in type_name_lower or "figure" in label_str:
+                    figure_crops.append(_convert_pil_to_tensor(crop))
+                    fig_num = len(figure_crops)
+                    page_elements[page_no].append(f"![Figure {fig_num}]({_convert_pil_to_data_uri(crop)})")
+                    continue
+
+                if "table" in type_name_lower or "table" in label_str:
+                    text = _run_vlm_pil(crop, table_prompt).strip()
+                    if text:
+                        page_elements[page_no].append(text)
+                    continue
+
+                if "formula" in label_str or "equation" in label_str:
+                    latex = _run_vlm_pil(crop, formula_prompt).strip()
+                    if latex and not latex.startswith("$$"):
+                        latex = f"$${latex}$$"
+                    if latex:
+                        page_elements[page_no].append(latex)
+                    continue
+
+                if "sectionheader" in type_name_lower or "title" in label_str or "header" in label_str:
+                    title = _run_vlm_pil(crop, title_prompt).strip()
+                    if title:
+                        page_elements[page_no].append(f"## {title}")
+                    continue
+
+                text = _run_vlm_pil(crop, text_prompt).strip()
+                if text:
+                    page_elements[page_no].append(text)
+
+            sorted_pages = sorted(page_elements.keys())
+            page_markdown = ["\n\n".join(page_elements[p]).strip() for p in sorted_pages]
+            final_markdown = "\n\n---\n\n".join(page_markdown) if len(page_markdown) > 1 else (page_markdown[0] if page_markdown else "")
+
+            if figure_crops:
+                max_h = max(int(t.shape[1]) for t in figure_crops)
+                max_w = max(int(t.shape[2]) for t in figure_crops)
+                padded = []
+                for t in figure_crops:
+                    h, w = int(t.shape[1]), int(t.shape[2])
+                    if h < max_h or w < max_w:
+                        canvas = torch.zeros(1, max_h, max_w, t.shape[3], dtype=t.dtype, device=t.device)
+                        canvas[:, :h, :w, :] = t
+                        padded.append(canvas)
+                    else:
+                        padded.append(t)
+                figure_images = torch.cat(padded, dim=0)
+            else:
+                figure_images = torch.zeros(1, 1, 1, 3, dtype=torch.float32)
+
+            _cleanup_global_llm(memory_cleanup)
+
+            payload = {
+                "document_name": document_name,
+                "page_count": len(getattr(doc, "pages", []) or []),
+                "items": layout_items,
+            }
+            return (final_markdown, figure_images, json.dumps(payload, indent=2, ensure_ascii=False))
+
+        except Exception as e:
+            print(f"[DoclingLayoutMarkdown] Error: {str(e)}")
+            raise RuntimeError(f"Docling Layout Markdown Error: {str(e)}") from e
 
 
 

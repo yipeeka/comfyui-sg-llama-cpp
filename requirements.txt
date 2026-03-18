@@ -3,3 +3,4 @@ pymupdf
 doclayout-yolo
 huggingface_hub
 opencv-python-headless
+docling

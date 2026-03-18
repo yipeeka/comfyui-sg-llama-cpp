@@ -16,6 +16,8 @@ ComfyUI custom node that acts as a llama-cpp-python wrapper, with support for vi
 - Memory management options
 - **PDF Loader**: Convert PDF pages to ComfyUI IMAGE batches (requires `pymupdf`)
 - **FireRed-OCR**: Dedicated document OCR node (PDF/image → Markdown, with LaTeX & HTML table support)
+- **Docling Layout Analysis**: Use Docling's layout pipeline on page images and expose the detected structure as JSON
+- **Docling Hybrid Markdown**: Use Docling for layout analysis and a separate vision LLM for recognition/Markdown stitching
 - **DocLayout-YOLO**: Integrated layout analysis for complex documents to group and sort elements by reading order.
 
 ## Installation
@@ -189,6 +191,61 @@ Dedicated OCR node for **FireRed-OCR GGUF** models. Converts document/page image
 2. In `LlamaCPPModelLoader`: set `mmproj_model_name` and pick the `vision-qwen25vl` (or similar) chat format.
 3. Set `n_ctx` to `32768`+ in `LlamaCPPOptions`.
 4. Connect: `PDF Loader → LlamaCPPModelLoader → FireRed OCR Engine → Show Text`
+
+---
+
+### DoclingLayoutAnalyzer
+Runs Docling's layout pipeline on a document image batch and emits a JSON summary of the detected items.
+
+This is useful when you want Docling's reading order and block structure, but you want to inspect or post-process the layout yourself instead of exporting directly through Docling.
+
+**Inputs**
+- **Required**:
+  - `image`: Document page image batch.
+- **Optional**:
+  - `document_name`: Logical name for the conversion input.
+  - `do_ocr`: Enable Docling OCR during layout analysis.
+  - `do_table_structure`: Enable Docling table-structure analysis.
+  - `images_scale`: Image scale used by Docling page rendering.
+
+**Outputs**
+- `layout_json`: JSON summary with page number, type, label, text preview, and bbox when available.
+
+**Quick setup**
+`PDF Loader → Docling Layout Analyzer → Show Text`
+
+---
+
+### DoclingLayoutMarkdownEngine
+Hybrid OCR pipeline that uses **Docling for layout analysis** and a separate **vision LLM** for recognition.
+
+This node is the closest Docling-based counterpart to `DocLayoutMarkdownEngine`. Instead of YOLO detecting regions, Docling provides the document structure and reading order. The cropped regions are then sent to your selected vision model for OCR / table extraction / formula recognition.
+
+**Inputs**
+- **Required**:
+  - `image`: Document page image batch.
+  - `llm_model`: Vision model from `LlamaCPPModelLoader` with `mmproj`.
+- **Optional**:
+  - `options`: Llama.cpp options.
+  - `document_name`: Logical name for Docling conversion.
+  - `do_ocr`: Enable Docling OCR during layout analysis.
+  - `do_table_structure`: Enable Docling table-structure analysis.
+  - `images_scale`: Image scale used by Docling page rendering.
+  - `max_tokens`, `temperature`, `memory_cleanup`, `seed`, `enable_thinking`
+  - `text_prompt`, `title_prompt`, `formula_prompt`, `table_prompt`
+
+**Outputs**
+- `markdown`: Final stitched markdown
+- `figure_images`: All detected figure crops as a ComfyUI `IMAGE` batch
+- `layout_json`: JSON summary of the Docling-detected layout
+
+**Quick setup**
+`PDF Loader → LlamaCPPModelLoader → Docling Layout Markdown Engine → Show Text`
+
+**Recommended use**
+- Use this when you want stronger document-aware segmentation than YOLO
+- Keep `do_ocr` disabled if you want the external LLM to do the actual recognition
+- Enable `do_table_structure` for scientific PDFs and reports
 
 ---
 
