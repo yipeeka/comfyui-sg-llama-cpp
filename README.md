@@ -205,7 +205,7 @@ Loads the DocLayout-YOLO model for advanced document layout analysis.
 ---
 
 ### DocLayoutMarkdownEngine
-Advanced structured OCR pipeline. Uses YOLO to identify page layout regions (titles, paragraphs, formulas, tables, figures), sorts them into reading order, and uses a Vision LLM (like FireRed-OCR or Qwen2.5-VL) to extract the text and formatting for each specific region.
+Advanced structured OCR pipeline. Uses YOLO to identify page layout regions (titles, paragraphs, formulas, tables, figures), sorts them into reading order, and uses a Vision LLM (like FireRed-OCR or Qwen2.5-VL) to extract the text and formatting.
 
 **Inputs**
 - **Required**:
@@ -214,9 +214,12 @@ Advanced structured OCR pipeline. Uses YOLO to identify page layout regions (tit
   - `llm_model`: Vision LLM from `LlamaCPPModelLoader` (requires `mmproj`).
 - **Optional**:
   - `options`: Llama.cpp options.
-  - `text_prompt`: Custom prompt for extracting plain text and titles.
-  - `formula_prompt`: Custom prompt for LaTeX equation conversion.
-  - `table_prompt`: Custom prompt for Markdown table extraction.
+  - `processing_mode`: Choose how to process text regions (default: `per_region`).
+    - `per_region`: High accuracy, slower. Every text block sends a separate crop to the VLM.
+    - `full_page_ocr`: Much faster for text-heavy documents. YOLO extracts figures (crops them and embeds as `![Figure N]`), while the rest of the page is sent to the VLM in a single shot.
+  - `max_page_size`: In `full_page_ocr` mode, limits the page image's longest edge (px) before sending it to the LLM to prevent KV-cache OOMs (default: `1024`).
+  - `text_prompt`, `formula_prompt`, `table_prompt`: Custom prompts for `per_region` extraction.
+  - `page_ocr_prompt`: Custom prompt for `full_page_ocr` whole-page extraction.
   - `yolo_conf`: YOLO detection confidence threshold (default: `0.2`).
   - `yolo_imgsz`: Image scaling size for YOLO inference (default: `1024`).
   - `enable_thinking`: Enable/disable `<think>` generation for the Vision model.
@@ -225,8 +228,8 @@ Advanced structured OCR pipeline. Uses YOLO to identify page layout regions (tit
   - `memory_cleanup`: RAM/VRAM cleanup behavior.
 
 **Outputs**
-- `markdown`: The final stitched markdown document (ordered top-to-bottom).
-- `figure_images`: Extracted figure/photograph crops as a ComfyUI IMAGE batch.
+- `markdown`: The final stitched markdown document (ordered top-to-bottom). Base64-encoded figure images are embedded directly within the markdown.
+- `figure_images`: All detected figure crops stacked into a single ComfyUI `IMAGE` batch `(N, H, W, C)` for further processing (padded to common dimensions). If no figures exist, returns a 1x1 placeholder.
 
 ---
 
